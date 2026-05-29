@@ -30,7 +30,7 @@ import {
 } from "./formatters.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
-import { connectGateway, type MessageCreateEvent } from "./gateway.js";
+import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
 import {
   handleAcpOutput,
   routeMessageToAgent,
@@ -187,9 +187,16 @@ type DiscordRuntime = {
   baseUrl: string;
   cmdCtx: CommandContext;
   adapter: DiscordAdapter;
-  gateway: { close: () => void } | null;
+  gateway: GatewayHandle | null;
   /** Set when the gateway reports a permanent failure, so re-bootstrap reconnects. */
   gatewayFailed: boolean;
+  /**
+   * Tear-down for the voice client bound to this runtime's gateway, or null when
+   * voice is disabled or failed to start. Voice is owned by the runtime because
+   * it rides the runtime's gateway socket: retiring the runtime must take voice
+   * with it, or a retired company's connection would keep listening.
+   */
+  voiceStop: (() => void) | null;
   /**
    * Whether the live connection identified with message intents. Intents are
    * fixed at identify time, so a change here needs a reconnect.
@@ -785,6 +792,22 @@ async function handleMessageCreate(
  * outlive its ownership, least of all while the new owner's bootstrap is still
  * fallible.
  */
+/**
+ * Stop the runtime's voice client, if any. Never throws: voice tear-down runs on
+ * paths (retire, reconnect, shutdown) whose real work must proceed regardless.
+ */
+function stopVoice(ctx: PluginContext, rt: DiscordRuntime, reason: string): void {
+  const stop = rt.voiceStop;
+  if (!stop) return;
+  rt.voiceStop = null;
+  try {
+    stop();
+    ctx.logger.info("voice: stopped", { reason });
+  } catch (err) {
+    ctx.logger.warn("voice: stop failed", { reason, error: summarizeError(err) });
+  }
+}
+
 function retireRuntime(ctx: PluginContext, reason: string): void {
   const previous = runtime;
   runtime = null;
@@ -793,6 +816,7 @@ function retireRuntime(ctx: PluginContext, reason: string): void {
     companyId: previous.companyId,
     reason,
   });
+  stopVoice(ctx, previous, reason);
   if (previous.gateway) {
     try {
       previous.gateway.close();
@@ -972,6 +996,7 @@ async function bootstrapRuntime(
   const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
   const defaultGuildId = normalizeDiscordId(config.defaultGuildId);
   const listenForMessages = gatewayNeedsMessages(config);
+  const voiceEnv = readVoiceEnv();
 
   // Reuse the live connection only when nothing it identified with has changed.
   // Intents are fixed when the socket identifies (src/gateway.ts), so a change to
@@ -1013,8 +1038,12 @@ async function bootstrapRuntime(
   rt.escalationTimeoutMs = (config.escalationTimeoutMinutes || 30) * 60 * 1000;
   rt.digestMode = config.digestMode ?? "off";
   rt.listenForMessages = listenForMessages;
+  rt.voiceStop = rt.voiceStop ?? null;
 
   if (!reuseGateway) {
+    // Voice rides this socket's adapter; it cannot outlive the connection it
+    // subscribed to, so it goes down with the gateway it was started on.
+    if (existing) stopVoice(ctx, existing, "gateway replaced");
     const staleGateway = rt.gateway;
     rt.gateway = null;
     rt.gatewayFailed = false;
@@ -1072,11 +1101,17 @@ async function bootstrapRuntime(
         {
           listenForMessages,
           includeMessageContent: listenForMessages,
+          enableVoice: voiceEnv !== null,
           // Fatal close codes and identify-budget exhaustion stop the gateway
           // permanently; report it through plugin health instead of running
           // silently without realtime Discord connectivity.
           onPermanentFailure: (message, details) => {
-            if (runtime) runtime.gatewayFailed = true;
+            if (runtime) {
+              runtime.gatewayFailed = true;
+              // Voice signals over this socket; once it is permanently down the
+              // voice connection can neither rejoin nor be torn down cleanly later.
+              stopVoice(ctx, runtime, "gateway permanently down");
+            }
             runtimeHealth = { status: "degraded", message, details };
           },
         },
@@ -1096,6 +1131,9 @@ async function bootstrapRuntime(
   if (runtimeHealth.status !== "ok") {
     setRuntimeHealth({ status: "ok" });
   }
+
+  await startVoiceIfConfigured(ctx, rt, voiceEnv);
+
   ctx.logger.info("Discord plugin runtime started", {
     companyId,
     gateway: rt.gateway ? "connected" : "unavailable",
@@ -1104,6 +1142,77 @@ async function bootstrapRuntime(
 
   startBackfillIfEnabled(ctx, rt);
   return rt;
+}
+
+/**
+ * Start the voice client for this runtime, if voice is configured.
+ *
+ * Voice is optional in the strongest sense: its peer dependencies may not be
+ * installed at all, so the whole subsystem sits behind one dynamic import that
+ * is never reached when the environment does not ask for voice. Nothing in here
+ * may propagate — a plugin whose text routing works must keep working when voice
+ * does not.
+ */
+async function startVoiceIfConfigured(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  voiceEnv: ReturnType<typeof readVoiceEnv>,
+): Promise<void> {
+  if (!voiceEnv) {
+    ctx.logger.info(
+      "voice: disabled — set WAR_ROOM_GUILD_ID, WAR_ROOM_VOICE_CHANNEL_ID, " +
+        "MICHAEL_VOICE_WEBHOOK_URL and DEEPGRAM_API_KEY to enable it",
+    );
+    return;
+  }
+  if (rt.voiceStop) return;
+  const gatewayVoice = rt.gateway?.voice;
+  if (!gatewayVoice) return;
+
+  try {
+    const { WarRoomVoiceClient, createPluginDiscordAdapter } = await import("./voice/index.js");
+    const voiceClient = new WarRoomVoiceClient(ctx, {
+      guildId: voiceEnv.guildId,
+      voiceChannelId: voiceEnv.voiceChannelId,
+      textChannelWebhookUrl: voiceEnv.webhookUrl,
+      deepgramApiKey: voiceEnv.deepgramApiKey,
+      voiceAdapterCreator: createPluginDiscordAdapter(gatewayVoice),
+    });
+    rt.voiceStop = () => voiceClient.stop();
+    await voiceClient.start();
+  } catch (error) {
+    rt.voiceStop = null;
+    ctx.logger.error("voice: startup failed (continuing without voice)", {
+      error: summarizeError(error),
+    });
+  }
+}
+
+/**
+ * Voice is configured from the environment, not from company config.
+ *
+ * Phase 1 deliberately keeps voice off the settings surface: the operator wires
+ * the four variables on the container, and an install that sets none of them
+ * behaves exactly as it did before voice existed. Returns null unless all four
+ * required variables are present, so a half-configured voice never half-starts.
+ */
+function readVoiceEnv(): {
+  guildId: string;
+  voiceChannelId: string;
+  webhookUrl: string;
+  deepgramApiKey: string;
+} | null {
+  const guildId = process.env.WAR_ROOM_GUILD_ID;
+  const voiceChannelId = process.env.WAR_ROOM_VOICE_CHANNEL_ID;
+  const webhookUrl = process.env.MICHAEL_VOICE_WEBHOOK_URL;
+  const deepgramApiKey = process.env.DEEPGRAM_API_KEY;
+  if (!guildId || !voiceChannelId || !webhookUrl || !deepgramApiKey) return null;
+  return {
+    guildId,
+    voiceChannelId,
+    webhookUrl,
+    deepgramApiKey,
+  };
 }
 
 /** Whether this configuration needs the message-carrying gateway intents. */
@@ -1284,6 +1393,7 @@ const plugin = definePlugin({
     // flag against the live config, and no-ops until the runtime exists.
 
     ctx.events.on("plugin.stopping", async () => {
+      if (runtime) stopVoice(ctx, runtime, "plugin stopping");
       runtime?.gateway?.close();
     });
 
