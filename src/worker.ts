@@ -227,12 +227,6 @@ let bootstrapInFlight: Promise<DiscordRuntime | null> | null = null;
 /** Last host error from a scoped config read, for the degraded-health message. */
 let lastScopedConfigError: string | null = null;
 /**
- * Bumped every time a runtime is adopted. A walk that awaited a read across an
- * adoption is working from a stale world and must drop its result.
- */
-let runtimeAdoptionSequence = 0;
-
-/**
  * Company enumeration for the startup walk.
  *
  * One snapshot request, never offset paging: the host re-runs the whole company
@@ -273,7 +267,6 @@ export function _resetRuntimeForTests(): void {
   bootstrapInFlight = null;
   bootstrapQueue = Promise.resolve();
   lastScopedConfigError = null;
-  runtimeAdoptionSequence = 0;
   nextOpportunisticBootstrapAt = 0;
   seenEvents.clear();
   runtimeHealth = {
@@ -939,7 +932,6 @@ async function bootstrapRuntime(
   }
 
   // Publish before the network work: gateway callbacks read the module runtime.
-  if (runtime !== rt) runtimeAdoptionSequence += 1;
   runtime = rt;
 
   if (defaultGuildId) {
@@ -1101,15 +1093,23 @@ async function bootstrapFromScopedConfig(
 }
 
 /**
- * Best-effort startup walk: enumerate companies in the host's replay order, try
- * each company's stored config, and adopt the first one that answers with a
- * usable bot token. Works from 2026.817.0, where the host seeds proactive
- * company scopes for companies that already have a config row.
+ * Best-effort startup walk: find the company the host considers this worker's
+ * owner, and bind to that one or to nobody.
+ *
+ * The owner is the lowest company id that has a stored config ROW — whether or
+ * not the plugin can actually start from it. The host replays rows in that order
+ * (`listConfigs` orders by `companyId` ascending) and the SDK records the first
+ * delivery as the single-tenant owner, refusing every different company
+ * afterwards. So "readable row found" decides ownership; "runtime started" does
+ * not. Skipping an owner whose secret no longer resolves in order to bind the
+ * next company would leave a live gateway for a company the host does not
+ * consider the owner: that company's own replay and every later save would be
+ * refused, and it would run indefinitely on stale configuration.
  *
  * Probing stops after COMPANY_PROBE_LIMIT companies. That prefix is a true
- * prefix of the same sorted set the host replays from, so whatever it adopts is
- * the host's choice too; if the first configured company sits beyond it, the walk
- * adopts nobody and waits for the delivery rather than binding to the wrong one.
+ * prefix of the same sorted set the host replays from, so an owner found inside
+ * it is the host's owner too; if the first configured company sits beyond it, the
+ * walk adopts nobody and waits for the delivery.
  */
 async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRuntime | null> {
   const companyIds = await listAllCompanyIds(ctx);
@@ -1117,17 +1117,21 @@ async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRunt
 
   const probeSet = companyIds.slice(0, COMPANY_PROBE_LIMIT);
   for (const companyId of probeSet) {
-    // Snapshot before the awaited read: a delivery may adopt a runtime while we
-    // are waiting, and this walk's view of the world is then stale.
-    const sequenceBefore = runtimeAdoptionSequence;
-    const started = await bootstrapFromScopedConfig(ctx, companyId);
-    if (runtimeAdoptionSequence !== sequenceBefore && runtime && runtime !== started) {
-      ctx.logger.debug("Startup walk superseded by a configuration delivery; dropping its result", {
-        companyId,
-      });
-      return runtime;
+    const rawConfig = await readScopedConfig(ctx, companyId);
+    if (!rawConfig || Object.keys(rawConfig).length === 0) continue;
+
+    // This company owns the worker. Bind to it or to nobody.
+    const started = await bootstrapRuntime(ctx, companyId, rawConfig);
+    if (!started) {
+      // bootstrapRuntime has already degraded health naming this company's
+      // problem; falling through to another company would bind the wrong owner.
+      ctx.logger.warn(
+        "Discord plugin could not start from its owning company's configuration; " +
+          "not falling back to another company",
+        { companyId },
+      );
     }
-    if (started) return started;
+    return started;
   }
 
   if (companyIds.length > probeSet.length) {
@@ -1135,6 +1139,11 @@ async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRunt
       probed: probeSet.length,
       companies: companyIds.length,
     });
+  } else {
+    degradeHealth(
+      "No company has a stored configuration for this plugin yet. Save the plugin configuration to activate it.",
+      "discord-awaiting-company-config",
+    );
   }
   return null;
 }
@@ -1195,14 +1204,15 @@ async function listAllCompanyIds(ctx: PluginContext): Promise<string[] | null> {
  * a request for any other one. Probing each company inside this invocation
  * therefore identifies the delivered scope: only the right company answers.
  * Guessing `companies[0]` instead gets the request denied as a scope mismatch
- * whenever the configured company is not first in the list.
+ * whenever the configured company is not first in the list. Assuming the running
+ * company is just as unfounded: a delivery for a DIFFERENT company arrives the
+ * same way, and treating it as the running one attempts a resolution the host
+ * denies, degrading a perfectly healthy runtime.
  */
 async function identifyDeliveredCompany(
   ctx: PluginContext,
   deliveredConfig: unknown,
 ): Promise<string | null> {
-  if (runtime) return runtime.companyId;
-
   // Not limited to the ownership probe prefix: the delivered company can sit
   // anywhere in the sorted set, and the set is already bounded by the snapshot cap.
   const companyIds = (await listAllCompanyIds(ctx)) ?? [];
@@ -2246,7 +2256,30 @@ const plugin = definePlugin({
     await queueBootstrap(async () => {
       let companyId = context?.companyId ?? null;
       if (!companyId) {
-        companyId = await identifyDeliveredCompany(ctx, newConfig);
+        const running = runtime;
+        if (running) {
+          // Do NOT assume a context-less delivery belongs to the running company.
+          // Probe it inside this invocation: on 720/722 only the invocation's own
+          // company answers, so a success is evidence, and a denial means this
+          // delivery belongs to somebody else.
+          const ownConfig = await readScopedConfig(ctx, running.companyId);
+          if (ownConfig) {
+            companyId = running.companyId;
+          } else {
+            const other = await identifyDeliveredCompany(ctx, newConfig);
+            ctx.logger.warn(
+              other
+                ? `Discord plugin ignoring configuration for company ${other}; this install serves ${running.companyId}`
+                : `Discord plugin ignoring a configuration delivery it could not attribute; this install serves ${running.companyId}`,
+              { runningCompanyId: running.companyId, deliveredCompanyId: other },
+            );
+            // The running company is untouched: keep its gateway and its health.
+            return;
+          }
+        } else {
+          companyId = await identifyDeliveredCompany(ctx, newConfig);
+        }
+
         if (companyId) {
           ctx.logger.info("Config delivered without a company scope; identified it by scoped probe", {
             companyId,

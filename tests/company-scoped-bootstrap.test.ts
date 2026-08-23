@@ -377,6 +377,40 @@ describe("host matrix: 2026.720.0 / 2026.722.0 (every scoped read denied)", () =
     });
   });
 
+  it("leaves the running company untouched when a context-less delivery belongs to another", async () => {
+    // A is running. On 720/722 a save for B arrives with no context, inside an
+    // invocation scoped to B. Treating it as A's delivery attempts an A-scoped
+    // resolution the host denies, degrading a perfectly healthy runtime.
+    const host = buildHost({
+      companies: [COMPANY_A, COMPANY_B],
+      rows: { [COMPANY_A]: storedConfig(), [COMPANY_B]: storedConfig() },
+      enforceInvocationScope: true,
+    });
+
+    // Bring A up through its own scoped delivery.
+    host.setInvocationScope(COMPANY_A);
+    await definition().setup(host.ctx);
+    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(await definition().onHealth()).toEqual({ status: "ok" });
+    const gatewaysAfterA = liveGateways().length;
+
+    // Now B saves, context-less, inside B's invocation.
+    host.setInvocationScope(COMPANY_B);
+    await definition().onConfigChanged(storedConfig({ defaultChannelId: "1490610083728588950" }));
+    host.setInvocationScope(null);
+
+    // A is untouched: same company, same gateway, still healthy.
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(_getRuntimeForTests()?.defaultChannelId).toBe("1490608926423646298");
+    expect(liveGateways()).toHaveLength(gatewaysAfterA);
+    expect(await definition().onHealth()).toEqual({ status: "ok" });
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(`ignoring configuration for company ${COMPANY_B}`),
+      expect.objectContaining({ runningCompanyId: COMPANY_A, deliveredCompanyId: COMPANY_B }),
+    );
+  });
+
   it("degrades with a clear message when no company scope can be identified", async () => {
     const { ctx } = buildHost({ companies: [COMPANY_A, COMPANY_B], denyScopedConfig: true });
     await definition().setup(ctx);
@@ -402,7 +436,13 @@ describe("host matrix: >= 2026.817.0 (proactive company scopes)", () => {
     expect(await definition().onHealth()).toEqual({ status: "ok" });
   });
 
-  it("picks the first company that has a usable bot token", async () => {
+  it("binds the host's owner, or nobody — never a later company", async () => {
+    // The owner is the lowest company id with a stored config ROW, whether or not
+    // the plugin can start from it: the host replays rows in that order and the
+    // SDK records the first delivery as the single-tenant owner. Skipping A to
+    // bind B would leave a live B gateway while the SDK owns A — B's own replay
+    // and every later save would then be refused, and B would run forever on
+    // stale config. A's row is present here but its secret no longer resolves.
     const { ctx } = buildHost({
       companies: [COMPANY_A, COMPANY_B],
       rows: {
@@ -413,7 +453,26 @@ describe("host matrix: >= 2026.817.0 (proactive company scopes)", () => {
 
     await definition().setup(ctx);
 
-    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
+    expect(_getRuntimeForTests()).toBeNull();
+    expect(gatewayConnects).toHaveLength(0);
+    // B was never probed, let alone bootstrapped.
+    expect(ctx.config.get).not.toHaveBeenCalledWith(COMPANY_B);
+
+    const diagnostics = await definition().onHealth();
+    expect(diagnostics.status).toBe("degraded");
+    expect(diagnostics.details).toMatchObject({ companyId: COMPANY_A });
+  });
+
+  it("starts from the owner when its configuration is usable", async () => {
+    const { ctx } = buildHost({
+      companies: [COMPANY_A, COMPANY_B],
+      rows: { [COMPANY_A]: storedConfig(), [COMPANY_B]: storedConfig() },
+    });
+
+    await definition().setup(ctx);
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(ctx.config.get).not.toHaveBeenCalledWith(COMPANY_B);
   });
 
   it("adopts the same company the host's startup replay would, across pages", async () => {
