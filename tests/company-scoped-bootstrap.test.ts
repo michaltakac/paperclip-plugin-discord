@@ -330,6 +330,31 @@ describe("re-bootstrap on configuration changes", () => {
     expect(await definition().onHealth()).toEqual({ status: "ok" });
   });
 
+  it("does not open a second gateway when a save races an in-flight bootstrap", async () => {
+    // A slow startup walk plus a config save arriving mid-flight must not produce
+    // two Discord connections (#71 exists to prevent exactly that).
+    const { ctx } = buildHost();
+    let releaseWalk: () => void = () => {};
+    const walkGate = new Promise<void>((resolve) => { releaseWalk = resolve; });
+    const rows: Record<string, unknown> = { [COMPANY_A]: storedConfig() };
+    ctx.config.get.mockImplementation(async (companyId?: string) => {
+      if (!companyId) throw new Error(UNSCOPED_CONFIG_ERROR);
+      await walkGate;
+      return rows[companyId] ?? {};
+    });
+
+    const setupPromise = definition().setup(ctx);
+    const deliveryPromise = (async () => {
+      releaseWalk();
+      await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+    })();
+    await Promise.all([setupPromise, deliveryPromise]);
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(gatewayConnects).toHaveLength(1);
+    expect(gatewayCloses.count).toBe(0);
+  });
+
   it("stays bound to the running company when another company's config arrives", async () => {
     const { ctx } = buildHost();
     await definition().setup(ctx);

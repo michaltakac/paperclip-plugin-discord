@@ -2021,6 +2021,17 @@ const plugin = definePlugin({
       return;
     }
 
+    // Never race an in-flight opportunistic bootstrap: two bootstraps running at
+    // once could open two gateway connections, which is the failure class #71
+    // exists to prevent.
+    if (bootstrapInFlight) {
+      try {
+        await bootstrapInFlight;
+      } catch {
+        // The in-flight attempt reports its own failure; this delivery retries.
+      }
+    }
+
     // A delivery is fresh information: let opportunistic bootstraps retry too.
     nextOpportunisticBootstrapAt = 0;
     try {
