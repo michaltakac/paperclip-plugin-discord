@@ -45,6 +45,7 @@ import { processMediaMessage, type MediaAttachment } from "./media-pipeline.js";
 import { registerCommand, parseCommandMessage, executeCommand, listCommands } from "./custom-commands.js";
 import { registerWatch, checkWatches } from "./proactive-suggestions.js";
 import {
+  describeUnusableSecretRef,
   isUsableSecretRef,
   normalizeSecretRefId,
   resolveStartupDiscordBotToken,
@@ -184,6 +185,13 @@ type DiscordRuntime = {
   gateway: { close: () => void } | null;
   /** Set when the gateway reports a permanent failure, so re-bootstrap reconnects. */
   gatewayFailed: boolean;
+  /**
+   * Whether the live connection identified with message intents. Intents are
+   * fixed at identify time, so a change here needs a reconnect.
+   */
+  listenForMessages: boolean;
+  /** The first-install backfill runs at most once per runtime. */
+  backfillStarted: boolean;
   defaultGuildId: string | null;
   defaultChannelId: string;
   approvalsChannelId: string | null;
@@ -208,8 +216,16 @@ let runtimeHealth: DiscordRuntimeHealth = {
   },
 };
 
-/** In-flight bootstrap, so concurrent invocations do not race to start the runtime. */
+/**
+ * The single ordered critical section every bootstrap source runs inside.
+ * Host->worker requests are NOT serialized by the transport, so config deliveries
+ * and opportunistic bootstraps must queue against each other here.
+ */
+let bootstrapQueue: Promise<void> = Promise.resolve();
+/** In-flight opportunistic bootstrap, so concurrent invocations do not pile up. */
 let bootstrapInFlight: Promise<DiscordRuntime | null> | null = null;
+/** Last host error from a scoped config read, for the degraded-health message. */
+let lastScopedConfigError: string | null = null;
 /** Opportunistic bootstrap attempts are rate-limited; onConfigChanged bypasses this. */
 const BOOTSTRAP_RETRY_COOLDOWN_MS = 60_000;
 let nextOpportunisticBootstrapAt = 0;
@@ -235,6 +251,8 @@ export function _resetRuntimeForTests(): void {
   runtime = null;
   _pluginCtx = null;
   bootstrapInFlight = null;
+  bootstrapQueue = Promise.resolve();
+  lastScopedConfigError = null;
   nextOpportunisticBootstrapAt = 0;
   seenEvents.clear();
   runtimeHealth = {
@@ -740,6 +758,28 @@ async function handleMessageCreate(
  *
  * Never throws: every failure path degrades health and returns null.
  */
+/**
+ * Apply one company's stored configuration to the runtime.
+ *
+ * Callers MUST go through `queueBootstrap` — every bootstrap source shares one
+ * ordered critical section, because nothing serializes host->worker requests:
+ * the SDK's RPC reader dispatches each call without awaiting the previous one
+ * (packages/plugins/sdk/src/worker-rpc-host.ts). Two config saves arriving while
+ * a token resolution is pending would otherwise both reach `connectGateway` and
+ * leak a live connection.
+ *
+ * Idempotent by contract:
+ * - same company, same bot token, live gateway with the same intents → refresh
+ *   the EXISTING runtime object in place and keep the Discord connection. The
+ *   object identity matters: the gateway's callbacks were created once, at
+ *   connect time, and read the runtime they were given;
+ * - same company, rotated token, changed message intents, or a gateway that
+ *   failed permanently → tear the connection down and reconnect;
+ * - a different company while one is already running → log and keep the running
+ *   one (single-tenant; see "Runtime state").
+ *
+ * Never throws: every failure path degrades health and returns null.
+ */
 async function bootstrapRuntime(
   ctx: PluginContext,
   companyId: string,
@@ -763,12 +803,15 @@ async function bootstrapRuntime(
   // kill worker activation on a host that simply has not delivered config yet.
   // `onValidateConfig` is what fails a bad save loudly in the settings UI.
   if (!isUsableSecretRef(config.discordBotTokenRef)) {
+    // Never quote the supplied value: an operator can paste the raw bot token
+    // into this field and the host will persist it (its Ajv secret-ref format
+    // accepts any string; the extractor rejects only UUID-shaped ones).
     degradeHealth(
-      `[${PLUGIN_ID}] discordBotTokenRef is missing or empty; select the Discord bot token secret in plugin settings`,
+      `[${PLUGIN_ID}] ${describeUnusableSecretRef("discordBotTokenRef")}`,
       "discord-bot-token-missing",
       { companyId },
     );
-    ctx.logger.warn("Discord plugin config has no bot token reference", { companyId });
+    ctx.logger.warn("Discord plugin config has no usable bot token reference", { companyId });
     return null;
   }
 
@@ -797,68 +840,84 @@ async function bootstrapRuntime(
   }
 
   let paperclipBoardApiKey = "";
-  if (isUsableSecretRef(config.paperclipBoardApiKeyRef)) {
+  const boardApiKeyBinding = toSecretRefBinding(config.paperclipBoardApiKeyRef);
+  if (boardApiKeyBinding) {
     try {
-      paperclipBoardApiKey = await ctx.secrets.resolve(
-        toSecretRefBinding(config.paperclipBoardApiKeyRef)!,
-        { companyId, configPath: "paperclipBoardApiKeyRef" },
-      );
+      paperclipBoardApiKey = await ctx.secrets.resolve(boardApiKeyBinding, {
+        companyId,
+        configPath: "paperclipBoardApiKeyRef",
+      });
     } catch (err) {
       ctx.logger.warn("Discord plugin could not resolve Paperclip board API key; board features are disabled", {
-        error: summarizeError(err),
+        error: summarizeError(err, [config.paperclipBoardApiKeyRef, boardApiKeyBinding.secretId]),
         companyId,
       });
     }
+  } else if (config.paperclipBoardApiKeyRef) {
+    ctx.logger.warn(`Discord plugin ignoring paperclipBoardApiKeyRef: ${describeUnusableSecretRef("paperclipBoardApiKeyRef")}`, {
+      companyId,
+    });
   }
 
   const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
   const defaultGuildId = normalizeDiscordId(config.defaultGuildId);
-  const rt: DiscordRuntime = {
-    companyId,
-    config,
-    token,
-    tokenSecretId: normalizeSecretRefId(config.discordBotTokenRef) ?? "",
-    paperclipBoardApiKey,
-    baseUrl,
-    cmdCtx: {
-      baseUrl,
-      companyId,
-      token,
-      paperclipBoardApiKey,
-      defaultChannelId,
-      pluginCtx: ctx,
-    },
-    adapter: new DiscordAdapter(ctx, token),
-    gateway: null,
-    gatewayFailed: false,
-    defaultGuildId,
-    defaultChannelId,
-    approvalsChannelId: normalizeDiscordId(config.approvalsChannelId),
-    errorsChannelId: normalizeDiscordId(config.errorsChannelId),
-    bdPipelineChannelId: normalizeDiscordId(config.bdPipelineChannelId),
-    escalationChannelId: normalizeDiscordId(config.escalationChannelId) ?? defaultChannelId,
-    intelligenceChannelIds: normalizeDiscordIdList(config.intelligenceChannelIds),
-    retentionDays: config.intelligenceRetentionDays || 30,
-    escalationTimeoutMs: (config.escalationTimeoutMinutes || 30) * 60 * 1000,
-    digestMode: config.digestMode ?? "off",
-  };
+  const listenForMessages = gatewayNeedsMessages(config);
 
-  // Keep a healthy connection across a settings save; reconnect when the token
-  // changed or the gateway stopped for good (#71 reports that through health).
-  const reusableGateway =
-    existing && existing.gateway && !existing.gatewayFailed && existing.token === token
-      ? existing.gateway
-      : null;
-  if (existing?.gateway && !reusableGateway) {
-    try {
-      existing.gateway.close();
-    } catch (err) {
-      ctx.logger.debug("Closing the previous Discord gateway failed", { error: summarizeError(err) });
+  // Reuse the live connection only when nothing it identified with has changed.
+  // Intents are fixed when the socket identifies (src/gateway.ts), so a change to
+  // any message-requiring feature needs a new connection, in either direction.
+  const reuseGateway = Boolean(
+    existing &&
+      existing.gateway &&
+      !existing.gatewayFailed &&
+      existing.token === token &&
+      existing.listenForMessages === listenForMessages,
+  );
+
+  // Refresh the EXISTING object rather than replacing it, so a reused gateway's
+  // callbacks observe the new configuration immediately.
+  const rt: DiscordRuntime = existing ?? ({} as DiscordRuntime);
+  rt.companyId = companyId;
+  rt.config = config;
+  rt.token = token;
+  rt.tokenSecretId = normalizeSecretRefId(config.discordBotTokenRef) ?? "";
+  rt.paperclipBoardApiKey = paperclipBoardApiKey;
+  rt.baseUrl = baseUrl;
+  rt.cmdCtx = {
+    baseUrl,
+    companyId,
+    token,
+    paperclipBoardApiKey,
+    defaultChannelId,
+    pluginCtx: ctx,
+  };
+  rt.adapter = new DiscordAdapter(ctx, token);
+  rt.defaultGuildId = defaultGuildId;
+  rt.defaultChannelId = defaultChannelId;
+  rt.approvalsChannelId = normalizeDiscordId(config.approvalsChannelId);
+  rt.errorsChannelId = normalizeDiscordId(config.errorsChannelId);
+  rt.bdPipelineChannelId = normalizeDiscordId(config.bdPipelineChannelId);
+  rt.escalationChannelId = normalizeDiscordId(config.escalationChannelId) ?? defaultChannelId;
+  rt.intelligenceChannelIds = normalizeDiscordIdList(config.intelligenceChannelIds);
+  rt.retentionDays = config.intelligenceRetentionDays || 30;
+  rt.escalationTimeoutMs = (config.escalationTimeoutMinutes || 30) * 60 * 1000;
+  rt.digestMode = config.digestMode ?? "off";
+  rt.listenForMessages = listenForMessages;
+
+  if (!reuseGateway) {
+    const staleGateway = rt.gateway;
+    rt.gateway = null;
+    rt.gatewayFailed = false;
+    if (staleGateway) {
+      try {
+        staleGateway.close();
+      } catch (err) {
+        ctx.logger.debug("Closing the previous Discord gateway failed", { error: summarizeError(err) });
+      }
     }
   }
 
-  // Publish the runtime before the network work: gateway callbacks read it.
-  rt.gateway = reusableGateway;
+  // Publish before the network work: gateway callbacks read the module runtime.
   runtime = rt;
 
   if (defaultGuildId) {
@@ -871,38 +930,49 @@ async function bootstrapRuntime(
         }
       }
     } catch (err) {
-      ctx.logger.warn("Discord slash command registration failed", { error: summarizeError(err) });
+      ctx.logger.warn("Discord slash command registration failed", { error: summarizeError(err, [token]) });
     }
   }
 
-  if (!reusableGateway) {
-    const gatewayNeedsMessages =
-      config.enableInbound !== false ||
-      config.enableMediaPipeline === true ||
-      config.enableCustomCommands === true ||
-      config.enableProactiveSuggestions === true ||
-      config.enableIntelligence === true;
-
+  if (!reuseGateway) {
     try {
       rt.gateway = await connectGateway(
         ctx,
         token,
-        async (interaction) => handleInteraction(ctx, interaction as any, rt.cmdCtx),
-        gatewayNeedsMessages ? (message) => handleMessageCreate(ctx, rt, message) : undefined,
+        // Every callback reads the CURRENT runtime rather than closing over the
+        // one that existed at connect time — a reused connection must never keep
+        // serving a superseded configuration.
+        async (interaction) => {
+          const current = runtime;
+          if (!current) {
+            return respondToInteraction({
+              type: 4,
+              content: "Plugin is still starting up. Please try again in a moment.",
+              ephemeral: true,
+            });
+          }
+          return handleInteraction(ctx, interaction as any, current.cmdCtx);
+        },
+        listenForMessages
+          ? async (message) => {
+              const current = runtime;
+              if (current) await handleMessageCreate(ctx, current, message);
+            }
+          : undefined,
         {
-          listenForMessages: gatewayNeedsMessages,
-          includeMessageContent: gatewayNeedsMessages,
+          listenForMessages,
+          includeMessageContent: listenForMessages,
           // Fatal close codes and identify-budget exhaustion stop the gateway
           // permanently; report it through plugin health instead of running
           // silently without realtime Discord connectivity.
           onPermanentFailure: (message, details) => {
-            rt.gatewayFailed = true;
+            if (runtime) runtime.gatewayFailed = true;
             runtimeHealth = { status: "degraded", message, details };
           },
         },
       );
     } catch (err) {
-      const error = summarizeError(err);
+      const error = summarizeError(err, [token]);
       rt.gatewayFailed = true;
       degradeHealth(`Discord gateway connection failed: ${error}`, "discord-gateway-unavailable", {
         companyId,
@@ -919,11 +989,22 @@ async function bootstrapRuntime(
   ctx.logger.info("Discord plugin runtime started", {
     companyId,
     gateway: rt.gateway ? "connected" : "unavailable",
-    reusedConnection: reusableGateway !== null,
+    reusedConnection: reuseGateway,
   });
 
   startBackfillIfEnabled(ctx, rt);
   return rt;
+}
+
+/** Whether this configuration needs the message-carrying gateway intents. */
+function gatewayNeedsMessages(config: DiscordConfig): boolean {
+  return (
+    config.enableInbound !== false ||
+    config.enableMediaPipeline === true ||
+    config.enableCustomCommands === true ||
+    config.enableProactiveSuggestions === true ||
+    config.enableIntelligence === true
+  );
 }
 
 /** First-install historical intelligence backfill, fire-and-forget. */
@@ -931,6 +1012,8 @@ function startBackfillIfEnabled(ctx: PluginContext, rt: DiscordRuntime): void {
   if (!rt.config.enableIntelligence || rt.intelligenceChannelIds.length === 0 || !rt.defaultGuildId) {
     return;
   }
+  if (rt.backfillStarted) return;
+  rt.backfillStarted = true;
   void (async () => {
     const cid = await resolveCompanyId(ctx);
     const existing = await ctx.state.get({
@@ -950,7 +1033,30 @@ function startBackfillIfEnabled(ctx: PluginContext, rt: DiscordRuntime): void {
         rt.config.backfillDays ?? 90,
       );
     }
-  })().catch((err) => ctx.logger.warn("Backfill failed", { error: summarizeError(err) }));
+  })().catch((err) => ctx.logger.warn("Backfill failed", { error: summarizeError(err, [rt.token]) }));
+}
+
+/**
+ * Read one company's stored config with an explicit scope.
+ *
+ * On a 2026.720/722 host this doubles as a scope probe: the host enforces the
+ * invocation's company, so a read for any other company is denied.
+ */
+async function readScopedConfig(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const rawConfig = await ctx.config.get(companyId);
+    return (rawConfig as Record<string, unknown>) ?? null;
+  } catch (err) {
+    lastScopedConfigError = summarizeError(err);
+    ctx.logger.debug("Company-scoped plugin config is not readable", {
+      companyId,
+      error: lastScopedConfigError,
+    });
+    return null;
+  }
 }
 
 /** Read one company's stored config with an explicit scope, then bootstrap from it. */
@@ -958,23 +1064,17 @@ async function bootstrapFromScopedConfig(
   ctx: PluginContext,
   companyId: string,
 ): Promise<DiscordRuntime | null> {
-  let rawConfig: unknown;
-  try {
-    rawConfig = await ctx.config.get(companyId);
-  } catch (err) {
-    const error = summarizeError(err);
-    ctx.logger.info("Company-scoped plugin config is not readable yet; waiting for the host to deliver it", {
-      companyId,
-      error,
-    });
+  const rawConfig = await readScopedConfig(ctx, companyId);
+  if (!rawConfig) {
     degradeHealth(
-      `Company-scoped configuration is not readable yet (${error}). Save the plugin configuration once to activate the runtime.`,
+      `Company-scoped configuration is not readable yet (${lastScopedConfigError ?? "no configuration delivered"}). ` +
+        "Save the plugin configuration to activate the runtime.",
       "discord-scoped-config-denied",
       { companyId },
     );
     return null;
   }
-  if (!rawConfig || Object.keys(rawConfig as Record<string, unknown>).length === 0) return null;
+  if (Object.keys(rawConfig).length === 0) return null;
   return bootstrapRuntime(ctx, companyId, rawConfig);
 }
 
@@ -984,21 +1084,75 @@ async function bootstrapFromScopedConfig(
  * seeds proactive company scopes for companies that already have a config row.
  */
 async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRuntime | null> {
-  let companies: Array<{ id: string }> = [];
-  try {
-    companies = await ctx.companies.list();
-  } catch (err) {
-    ctx.logger.info("Could not list companies during startup; waiting for a config delivery", {
-      error: summarizeError(err),
-    });
-    return null;
-  }
-
-  for (const company of companies) {
+  for (const company of await listCompanies(ctx)) {
     const started = await bootstrapFromScopedConfig(ctx, company.id);
     if (started) return started;
   }
   return null;
+}
+
+async function listCompanies(ctx: PluginContext): Promise<Array<{ id: string }>> {
+  try {
+    return await ctx.companies.list();
+  } catch (err) {
+    ctx.logger.info("Could not list companies; waiting for a config delivery", {
+      error: summarizeError(err),
+    });
+    return [];
+  }
+}
+
+/**
+ * Identify which company a context-less config delivery belongs to.
+ *
+ * The v2026.720.0 and v2026.722.0 SDKs call `onConfigChanged(config)` with no
+ * scope, but the host still binds the invocation to the real company and denies
+ * a request for any other one. Probing each company inside this invocation
+ * therefore identifies the delivered scope: only the right company answers.
+ * Guessing `companies[0]` instead gets the request denied as a scope mismatch
+ * whenever the configured company is not first in the list.
+ */
+async function identifyDeliveredCompany(
+  ctx: PluginContext,
+  deliveredConfig: unknown,
+): Promise<string | null> {
+  if (runtime) return runtime.companyId;
+
+  const companies = await listCompanies(ctx);
+  const readable: Array<{ id: string; config: Record<string, unknown> }> = [];
+  for (const company of companies) {
+    const config = await readScopedConfig(ctx, company.id);
+    if (config) readable.push({ id: company.id, config });
+  }
+
+  if (readable.length === 0) return null;
+  if (readable.length === 1) return readable[0].id;
+
+  // A host that answers for several companies (>= 2026.817.0) is not telling us
+  // which one was saved; match the delivered secret reference against the rows.
+  const deliveredSecretId = normalizeSecretRefId(
+    (deliveredConfig as Record<string, unknown> | null)?.discordBotTokenRef,
+  );
+  if (deliveredSecretId) {
+    const match = readable.find(
+      (row) => normalizeSecretRefId(row.config.discordBotTokenRef) === deliveredSecretId,
+    );
+    if (match) return match.id;
+  }
+  return readable[0].id;
+}
+
+/**
+ * Run one bootstrap attempt inside the single ordered critical section shared by
+ * every bootstrap source (startup walk, invocation, config delivery).
+ */
+function queueBootstrap<T>(work: () => Promise<T>): Promise<T> {
+  const next = bootstrapQueue.then(work, work);
+  bootstrapQueue = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
 }
 
 /**
@@ -1016,8 +1170,9 @@ async function ensureRuntime(
   if (Date.now() < nextOpportunisticBootstrapAt) return null;
   nextOpportunisticBootstrapAt = Date.now() + BOOTSTRAP_RETRY_COOLDOWN_MS;
 
-  bootstrapInFlight = (async () => {
+  bootstrapInFlight = queueBootstrap(async () => {
     try {
+      if (runtime) return runtime;
       if (companyId) {
         const started = await bootstrapFromScopedConfig(pluginCtx, companyId);
         if (started) return started;
@@ -1029,7 +1184,7 @@ async function ensureRuntime(
     } finally {
       bootstrapInFlight = null;
     }
-  })();
+  });
 
   return bootstrapInFlight;
 }
@@ -1984,65 +2139,55 @@ const plugin = definePlugin({
 
   /**
    * The host delivers stored config here — at worker startup and on every save —
-   * WITH its company scope. On a 2026.720/722 host this is the only path that can
-   * start the runtime, because scoped `config.get()` is denied there for every
-   * company. `companyId` is null for an instance/global save; resolve a scope
-   * ourselves in that case, since `secrets.resolve` needs one.
+   * and, from SDK v2026.817.0, with its company scope.
+   *
+   * The v2026.720.0 and v2026.722.0 SDKs call this with the config ALONE
+   * (`onConfigChanged(params.config)`), even though the host binds the RPC
+   * invocation to the real company and denies a read for any other one. So when
+   * no scope is handed over, probe for it inside this invocation instead of
+   * guessing: only the delivered company answers a scoped config read.
    */
   async onConfigChanged(newConfig, context): Promise<void> {
     const ctx = _pluginCtx;
     if (!ctx) return;
 
-    let companyId = context?.companyId ?? null;
-    if (!companyId) {
-      companyId = runtime?.companyId ?? null;
+    // A delivery is fresh information: let opportunistic bootstraps retry too.
+    nextOpportunisticBootstrapAt = 0;
+
+    // Queue against every other bootstrap source, including other deliveries:
+    // two concurrent saves would otherwise each open a gateway and leak one.
+    await queueBootstrap(async () => {
+      let companyId = context?.companyId ?? null;
       if (!companyId) {
-        try {
-          const companies = await ctx.companies.list();
-          companyId = companies[0]?.id ?? null;
-        } catch (err) {
-          ctx.logger.warn("Config change delivered without a company scope and companies could not be listed", {
-            error: summarizeError(err),
+        companyId = await identifyDeliveredCompany(ctx, newConfig);
+        if (companyId) {
+          ctx.logger.info("Config delivered without a company scope; identified it by scoped probe", {
+            companyId,
           });
         }
       }
-      if (companyId) {
-        ctx.logger.info("Config change delivered without a company scope; resolved one for secret resolution", {
+
+      if (!companyId) {
+        degradeHealth(
+          "Configuration was delivered without a company scope and no company answered a scoped " +
+            "configuration read, so its secrets cannot be resolved. Upgrade the host to v2026.817.0 or newer.",
+          "discord-config-scope-unknown",
+        );
+        return;
+      }
+
+      try {
+        // Bootstrap from the DELIVERED config, not a probe result: the delivery
+        // is the fresher of the two.
+        await bootstrapRuntime(ctx, companyId, newConfig);
+      } catch (err) {
+        const error = summarizeError(err);
+        ctx.logger.error("Discord plugin failed to apply a configuration change", { error, companyId });
+        degradeHealth(`Applying the delivered configuration failed: ${error}`, "discord-config-apply-failed", {
           companyId,
         });
       }
-    }
-
-    if (!companyId) {
-      degradeHealth(
-        "Configuration was delivered without a company scope and no company could be resolved; secrets cannot be resolved",
-        "discord-config-scope-unknown",
-      );
-      return;
-    }
-
-    // Never race an in-flight opportunistic bootstrap: two bootstraps running at
-    // once could open two gateway connections, which is the failure class #71
-    // exists to prevent.
-    if (bootstrapInFlight) {
-      try {
-        await bootstrapInFlight;
-      } catch {
-        // The in-flight attempt reports its own failure; this delivery retries.
-      }
-    }
-
-    // A delivery is fresh information: let opportunistic bootstraps retry too.
-    nextOpportunisticBootstrapAt = 0;
-    try {
-      await bootstrapRuntime(ctx, companyId, newConfig);
-    } catch (err) {
-      const error = summarizeError(err);
-      ctx.logger.error("Discord plugin failed to apply a configuration change", { error, companyId });
-      degradeHealth(`Applying the delivered configuration failed: ${error}`, "discord-config-apply-failed", {
-        companyId,
-      });
-    }
+    });
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {

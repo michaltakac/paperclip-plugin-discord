@@ -113,7 +113,7 @@ function buildPluginContext(config: Record<string, unknown>) {
 /** A config with all required fields present and features off. */
 function validConfig(overrides: Record<string, unknown> = {}) {
   return {
-    discordBotTokenRef: "fake-secret-ref",
+    discordBotTokenRef: { type: "secret_ref", secretId: "33333333-3333-3333-3333-333333333333" },
     defaultChannelId: "ch-1",
     defaultGuildId: "",
     enableIntelligence: false,
@@ -170,7 +170,7 @@ describe("required config handling (issues #53, #61)", () => {
       errors: [expect.stringContaining("discordBotTokenRef is required")],
     });
     await expect(
-      definition.onValidateConfig({ discordBotTokenRef: "secret-uuid" }),
+      definition.onValidateConfig({ discordBotTokenRef: "11111111-1111-4111-8111-111111111111" }),
     ).resolves.toMatchObject({
       ok: false,
       errors: [expect.stringContaining("defaultChannelId is required")],

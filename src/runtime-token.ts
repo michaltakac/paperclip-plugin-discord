@@ -11,26 +11,39 @@ export const SECRET_RESOLUTION_ISSUE_URL = "https://github.com/mvanhorn/papercli
 /** Health messages are operator-facing strings, not log sinks — keep them short. */
 export const MAX_HEALTH_ERROR_LENGTH = 300;
 
+/** What replaces any supplied value that would otherwise be echoed back out. */
+export const REDACTION_PLACEHOLDER = "[redacted]";
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * A secret reference as it can appear in stored plugin config.
  *
  * The Paperclip settings picker writes the object binding
- * (`{ type: "secret_ref", secretId, version }`); older hand-written configs
- * carry a bare secret UUID string. Both are accepted everywhere.
+ * (`{ type: "secret_ref", secretId, version }`); older hand-written configs carry
+ * a bare secret UUID string. Both are accepted — but only the object binding is
+ * ever sent to the host, because `secrets.resolve` rejects every string
+ * (server/src/services/plugin-secrets-handler.ts).
  */
 export type DiscordSecretRef = string | EnvSecretRefBinding | Record<string, unknown>;
+
+function isUuid(value: string): boolean {
+  return UUID_PATTERN.test(value.trim());
+}
 
 /**
  * Reduce any accepted secret-ref shape to its secret UUID.
  *
- * Use this for map keys, equality checks and logging — never for resolution,
- * which should pass the original binding through so the host sees the
- * version selector too.
+ * A bare string is accepted ONLY when it is UUID-shaped. The host's Ajv
+ * `secret-ref` format accepts any string and its config extractor rejects only
+ * UUID-shaped ones, so an operator who types a raw bot token into the field gets
+ * it persisted verbatim — this is the last line that keeps such a value from
+ * being treated as a reference and shipped to the host.
  */
 export function normalizeSecretRefId(value: unknown): string | undefined {
   if (typeof value === "string") {
     const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
+    return isUuid(trimmed) ? trimmed : undefined;
   }
   if (value && typeof value === "object") {
     const secretId = (value as { secretId?: unknown }).secretId;
@@ -43,26 +56,34 @@ export function normalizeSecretRefId(value: unknown): string | undefined {
 
 /** True when the config value can actually be handed to `ctx.secrets.resolve`. */
 export function isUsableSecretRef(value: unknown): boolean {
-  return normalizeSecretRefId(value) !== undefined;
+  return toSecretRefBinding(value) !== undefined;
 }
 
 /**
- * Pass a stored config value through to `ctx.secrets.resolve` in the shape the
- * SDK expects (`string | EnvSecretRefBinding`), preserving the version selector
- * from the picker binding.
+ * Convert a stored config value into the object binding the host requires.
+ *
+ * A valid binding is passed through untouched so host-specific fields
+ * (`projectionClass`, `projectionAllowlistKey`) survive. A legacy UUID string is
+ * canonicalized to `{ type: "secret_ref", secretId, version: "latest" }`, which
+ * is what keeps older configurations working against current hosts.
  */
-export function toSecretRefBinding(value: unknown): string | EnvSecretRefBinding | undefined {
+export function toSecretRefBinding(value: unknown): EnvSecretRefBinding | undefined {
   if (typeof value === "string") {
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
+    const secretId = normalizeSecretRefId(value);
+    return secretId ? { type: "secret_ref", secretId, version: "latest" } : undefined;
   }
   if (value && typeof value === "object") {
     const record = value as Record<string, unknown>;
     const secretId = normalizeSecretRefId(record);
     if (!secretId) return undefined;
+    if (record.type === "secret_ref") {
+      // Already the host's shape — hand it back as-is, version selector included.
+      return record as unknown as EnvSecretRefBinding;
+    }
     const binding: EnvSecretRefBinding = { type: "secret_ref", secretId };
-    if (typeof record.version === "string") {
-      binding.version = record.version as EnvSecretRefBinding["version"];
+    const version = record.version;
+    if (version === "latest" || typeof version === "number") {
+      binding.version = version;
     }
     return binding;
   }
@@ -70,15 +91,46 @@ export function toSecretRefBinding(value: unknown): string | EnvSecretRefBinding
 }
 
 /**
+ * Explain an unusable secret reference WITHOUT quoting what was supplied — the
+ * supplied value may be the secret itself.
+ */
+export function describeUnusableSecretRef(field: string): string {
+  return (
+    `${field} does not reference a Paperclip secret. Store the value as a secret, ` +
+    "then select it with the secret picker in plugin settings. Never type the value itself into this field."
+  );
+}
+
+/**
+ * Remove supplied values from text that is about to be published.
+ *
+ * The host interpolates a rejected secret reference into its error message, so
+ * anything we forward from the host can carry back whatever was configured.
+ * Redaction runs before truncation so a partial value cannot survive the cut.
+ * Literal replacement (not a regex) because secrets contain regex metacharacters.
+ */
+export function redactValues(text: string, values: Array<unknown>): string {
+  let out = text;
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    for (const candidate of [value, value.trim()]) {
+      if (candidate.length < 4) continue;
+      out = out.split(candidate).join(REDACTION_PLACEHOLDER);
+    }
+  }
+  return out;
+}
+
+/**
  * Turn a thrown value into a single-line, length-capped message safe to publish
  * through plugin health. Host errors ("company context is required", "secret not
  * found") are the most useful diagnostic an operator can get, so they are kept
- * verbatim up to the cap — but secrets never travel in error messages, and the
- * cap keeps a stack trace from flooding the health panel.
+ * up to the cap — with any supplied value scrubbed out first.
  */
-export function summarizeError(err: unknown): string {
+export function summarizeError(err: unknown, redact: Array<unknown> = []): string {
   const raw = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-  const singleLine = raw.replace(/\s+/g, " ").trim();
+  const scrubbed = redactValues(raw, redact);
+  const singleLine = scrubbed.replace(/\s+/g, " ").trim();
   if (singleLine.length <= MAX_HEALTH_ERROR_LENGTH) return singleLine;
   const suffix = " [truncated]";
   return `${singleLine.slice(0, MAX_HEALTH_ERROR_LENGTH - suffix.length)}${suffix}`;
@@ -99,12 +151,12 @@ export async function resolveStartupDiscordBotToken(
   setHealth: (health: DiscordRuntimeHealth) => void,
   options?: { companyId?: string; configPath?: string },
 ): Promise<string | undefined> {
+  const configPath = options?.configPath ?? "discordBotTokenRef";
   const binding = toSecretRefBinding(tokenRef);
   if (!binding) {
-    const message = "discordBotTokenRef is missing or empty; configure the Discord bot token secret in plugin settings";
     setHealth({
       status: "degraded",
-      message,
+      message: describeUnusableSecretRef(configPath),
       details: {
         issue: "discord-bot-token-missing",
         reference: SECRET_RESOLUTION_ISSUE_URL,
@@ -117,12 +169,13 @@ export async function resolveStartupDiscordBotToken(
   try {
     const token = await ctx.secrets.resolve(binding, {
       companyId: options?.companyId,
-      configPath: options?.configPath ?? "discordBotTokenRef",
+      configPath,
     });
     setHealth({ status: "ok" });
     return token;
   } catch (err) {
-    const error = summarizeError(err);
+    // Scrub whatever was configured: the host echoes a rejected reference back.
+    const error = summarizeError(err, [tokenRef, binding.secretId]);
     setHealth({
       status: "degraded",
       message: `Discord bot token secret could not be resolved: ${error}`,

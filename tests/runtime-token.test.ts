@@ -35,10 +35,45 @@ describe("secret-ref normalization", () => {
     });
   });
 
-  it("still accepts a legacy bare secret UUID string", () => {
-    expect(isUsableSecretRef(" secret-uuid ")).toBe(true);
-    expect(normalizeSecretRefId(" secret-uuid ")).toBe("secret-uuid");
-    expect(toSecretRefBinding(" secret-uuid ")).toBe("secret-uuid");
+  it("canonicalizes a legacy bare secret UUID into the object binding", () => {
+    // The host rejects EVERY string handed to secrets.resolve, so a legacy config
+    // only keeps working because the plugin converts it before resolving.
+    expect(isUsableSecretRef(" 11111111-1111-4111-8111-111111111111 ")).toBe(true);
+    expect(normalizeSecretRefId(" 11111111-1111-4111-8111-111111111111 ")).toBe("11111111-1111-4111-8111-111111111111");
+    expect(toSecretRefBinding(" 11111111-1111-4111-8111-111111111111 ")).toEqual({
+      type: "secret_ref",
+      secretId: "11111111-1111-4111-8111-111111111111",
+      version: "latest",
+    });
+  });
+
+  it("preserves a numeric pinned version", () => {
+    // EnvSecretRefBinding.version is `number | "latest"`.
+    expect(toSecretRefBinding({ secretId: "11111111-1111-4111-8111-111111111111", version: 2 })).toEqual({
+      type: "secret_ref",
+      secretId: "11111111-1111-4111-8111-111111111111",
+      version: 2,
+    });
+  });
+
+  it("passes a host binding through untouched so its extra fields survive", () => {
+    const binding = {
+      type: "secret_ref",
+      secretId: "11111111-1111-4111-8111-111111111111",
+      version: 3,
+      projectionClass: "env",
+    };
+    expect(toSecretRefBinding(binding)).toBe(binding);
+  });
+
+  it("refuses a string that is not a secret UUID", () => {
+    // The host persists such values (its Ajv secret-ref format accepts any string
+    // and the extractor rejects only UUID-shaped ones), so a raw bot token pasted
+    // into the field reaches the plugin. It must never be treated as a reference.
+    for (const value of ["not-a-uuid", "MTIzNDU2Nzg5.GaBcDe.rawBotTokenLookalike", "   "]) {
+      expect(isUsableSecretRef(value)).toBe(false);
+      expect(toSecretRefBinding(value)).toBeUndefined();
+    }
   });
 
   it("rejects empty, missing and malformed references", () => {
@@ -68,7 +103,7 @@ describe("resolveStartupDiscordBotToken", () => {
 
     const token = await resolveStartupDiscordBotToken(
       ctx,
-      "secret-ref",
+      "11111111-1111-4111-8111-111111111111",
       (next) => health.push(next),
       { companyId: "company-1" },
     );
@@ -97,7 +132,7 @@ describe("resolveStartupDiscordBotToken", () => {
 
     const token = await resolveStartupDiscordBotToken(
       ctx,
-      "secret-ref",
+      "11111111-1111-4111-8111-111111111111",
       (next) => health.push(next),
       { companyId: "company-1" },
     );

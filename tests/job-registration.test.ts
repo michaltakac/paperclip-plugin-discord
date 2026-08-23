@@ -62,7 +62,7 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
   const registeredJobs = new Map<string, Function>();
 
   const defaultConfig: Record<string, unknown> = {
-    discordBotTokenRef: "fake-secret-ref",
+    discordBotTokenRef: { type: "secret_ref", secretId: "33333333-3333-3333-3333-333333333333" },
     defaultGuildId: "",
     defaultChannelId: "ch-1",
     approvalsChannelId: "",

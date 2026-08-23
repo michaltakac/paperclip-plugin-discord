@@ -58,7 +58,7 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
   const stateStore = new Map<string, unknown>();
 
   const defaultConfig: Record<string, unknown> = {
-    discordBotTokenRef: "fake-secret-ref",
+    discordBotTokenRef: { type: "secret_ref", secretId: "33333333-3333-3333-3333-333333333333" },
     defaultGuildId: "",
     defaultChannelId: "ch-1",
     approvalsChannelId: "",
@@ -229,7 +229,7 @@ describe("event deduplication", () => {
     const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
     const configGet = ctx.config.get as ReturnType<typeof vi.fn>;
     configGet.mockResolvedValueOnce({
-      discordBotTokenRef: "fake-secret-ref",
+      discordBotTokenRef: { type: "secret_ref", secretId: "33333333-3333-3333-3333-333333333333" },
       defaultGuildId: "",
       defaultChannelId: "ch-1",
     });

@@ -10,9 +10,14 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // activation — which is exactly what every plugin used to do.
 //
 // These tests pin the behaviour on the three host generations the plugin has to
-// survive. The gated host mock makes an unscoped `config.get()` THROW rather than
-// return an empty object: a mock that quietly returns `{}` hides the bug (lesson
-// from telegram #83).
+// survive. The mocks copy the real host where it bites:
+//   - an unscoped `config.get()` THROWS, it never returns `{}` (telegram #83);
+//   - `secrets.resolve` REJECTS every string secretRef and interpolates the
+//     rejected value into its error (plugin-secrets-handler.ts);
+//   - with `enforceInvocationScope`, a scoped read succeeds only for the company
+//     the current host->worker invocation is bound to (720/722 semantics);
+//   - the gateway mock RETAINS the callbacks and options it was handed, so tests
+//     can invoke the real handlers the plugin installed.
 // ---------------------------------------------------------------------------
 
 const { capturedDefinitions } = vi.hoisted(() => {
@@ -28,15 +33,35 @@ vi.mock("@paperclipai/plugin-sdk", () => ({
   runWorker: vi.fn(),
 }));
 
+type GatewayConnect = {
+  token: string;
+  onInteraction: (interaction: unknown) => Promise<unknown>;
+  onMessage?: (message: any) => Promise<void> | void;
+  options: any;
+  closed: boolean;
+};
+
 const { gatewayConnects, gatewayCloses } = vi.hoisted(() => ({
-  gatewayConnects: [] as Array<{ token: string }>,
+  gatewayConnects: [] as any[],
   gatewayCloses: { count: 0 },
 }));
 
 vi.mock("../src/gateway.js", () => ({
-  connectGateway: vi.fn(async (_ctx: any, token: string) => {
-    gatewayConnects.push({ token });
-    return { close: () => { gatewayCloses.count += 1; } };
+  connectGateway: vi.fn(async (
+    _ctx: any,
+    token: string,
+    onInteraction: any,
+    onMessage: any,
+    options: any,
+  ) => {
+    const record: GatewayConnect = { token, onInteraction, onMessage, options, closed: false };
+    gatewayConnects.push(record);
+    return {
+      close: () => {
+        record.closed = true;
+        gatewayCloses.count += 1;
+      },
+    };
   }),
 }));
 
@@ -46,6 +71,7 @@ import { _resetCompanyIdCache } from "../src/company-resolver.js";
 const COMPANY_A = "11111111-1111-1111-1111-111111111111";
 const COMPANY_B = "22222222-2222-2222-2222-222222222222";
 const SECRET_ID = "33333333-3333-3333-3333-333333333333";
+const ROTATED_SECRET_ID = "44444444-4444-4444-4444-444444444444";
 
 /** Verbatim shape of the errors the governed host raises. */
 const UNSCOPED_CONFIG_ERROR =
@@ -54,6 +80,11 @@ const SCOPED_CONFIG_DENIED =
   'not allowed to perform "config.get": company context is required';
 const PRE_720_SECRET_KILL_SWITCH =
   "Plugin secret references are disabled on this host";
+
+/** Connections the plugin has opened and not closed. */
+function liveGateways(): GatewayConnect[] {
+  return (gatewayConnects as GatewayConnect[]).filter((g) => !g.closed);
+}
 
 /** The stored config row the settings picker produces. */
 function storedConfig(overrides: Record<string, unknown> = {}) {
@@ -82,6 +113,14 @@ type HostOptions = {
   denyScopedConfig?: boolean;
   /** A pre-720 host: the secret-ref kill switch is still in place. */
   secretsKillSwitch?: boolean;
+  /**
+   * Model the 720/722 invocation scope: a scoped read succeeds only for the
+   * company the CURRENT invocation is bound to, and is denied outright outside
+   * any invocation — which is where setup() runs.
+   */
+  enforceInvocationScope?: boolean;
+  /** Resolve the bot token to this value. */
+  token?: string;
 };
 
 function buildHost(options: HostOptions = {}) {
@@ -91,10 +130,15 @@ function buildHost(options: HostOptions = {}) {
     rows = { [COMPANY_A]: storedConfig() },
     denyScopedConfig = false,
     secretsKillSwitch = false,
+    enforceInvocationScope = false,
+    token = "discord-bot-token",
   } = options;
 
   const unscopedConfigReads: number[] = [];
   const stateStore = new Map<string, unknown>();
+  let invocationScope: string | null = null;
+  let secretResolutionGate: Promise<void> | null = null;
+  let releaseGate: () => void = () => {};
 
   const ctx = {
     config: {
@@ -104,14 +148,30 @@ function buildHost(options: HostOptions = {}) {
           unscopedConfigReads.push(1);
           throw new Error(UNSCOPED_CONFIG_ERROR);
         }
+        if (enforceInvocationScope) {
+          if (!invocationScope) throw new Error(UNSCOPED_CONFIG_ERROR);
+          if (companyId !== invocationScope) {
+            throw new Error(
+              `requested company "${companyId}" but the current invocation is scoped to company "${invocationScope}"`,
+            );
+          }
+        }
         if (denyScopedConfig) throw new Error(SCOPED_CONFIG_DENIED);
         return rows[companyId] ?? {};
       }),
     },
     secrets: {
-      resolve: vi.fn(async () => {
+      resolve: vi.fn(async (secretRef: unknown) => {
+        // Mirrors the real host: every string secretRef is rejected, and the
+        // rejected value is interpolated into the error message.
+        if (typeof secretRef === "string") {
+          throw new Error(
+            `Invalid secret reference for plugin: ${secretRef}. Use { type: "secret_ref", secretId, version? }`,
+          );
+        }
         if (secretsKillSwitch) throw new Error(PRE_720_SECRET_KILL_SWITCH);
-        return "discord-bot-token";
+        if (secretResolutionGate) await secretResolutionGate;
+        return token;
       }),
     },
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -139,7 +199,32 @@ function buildHost(options: HostOptions = {}) {
     http: { fetch: vi.fn(async () => ({ ok: true, json: async () => ({}), text: async () => "" })) },
   } as any;
 
-  return { ctx, unscopedConfigReads };
+  return {
+    ctx,
+    unscopedConfigReads,
+    /** Enter or leave a host->worker invocation bound to a company. */
+    setInvocationScope(companyId: string | null) {
+      invocationScope = companyId;
+    },
+    /** Hold every subsequent token resolution until releaseSecretResolution(). */
+    deferSecretResolution() {
+      secretResolutionGate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    },
+    releaseSecretResolution() {
+      secretResolutionGate = null;
+      releaseGate();
+    },
+    /** Everything the plugin published about itself, for leak assertions. */
+    everythingSaid(diagnostics: unknown) {
+      return JSON.stringify([
+        diagnostics,
+        ctx.logger.warn.mock.calls,
+        ctx.logger.error.mock.calls,
+        ctx.logger.info.mock.calls,
+        ctx.logger.debug.mock.calls,
+      ]);
+    },
+  };
 }
 
 function definition(): any {
@@ -185,12 +270,9 @@ describe("host matrix: 2026.720.0 / 2026.722.0 (every scoped read denied)", () =
     await definition().setup(ctx);
     expect(_getRuntimeForTests()).toBeNull();
 
-    // The host delivers the stored config with its scope — the only path that
-    // can start the runtime on this generation.
     await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
 
-    const runtime = _getRuntimeForTests();
-    expect(runtime?.companyId).toBe(COMPANY_A);
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
     expect(gatewayConnects).toHaveLength(1);
     expect(await definition().onHealth()).toEqual({ status: "ok" });
   });
@@ -206,7 +288,9 @@ describe("host matrix: 2026.720.0 / 2026.722.0 (every scoped read denied)", () =
     );
   });
 
-  it("accepts a legacy bare-UUID secret reference too", async () => {
+  it("canonicalizes a legacy bare-UUID reference into the object binding the host requires", async () => {
+    // Current hosts reject EVERY string handed to secrets.resolve, so an older
+    // configuration only keeps working if the plugin converts it before resolving.
     const { ctx } = buildHost({ denyScopedConfig: true });
     await definition().setup(ctx);
     await definition().onConfigChanged(storedConfig({ discordBotTokenRef: SECRET_ID }), {
@@ -214,24 +298,89 @@ describe("host matrix: 2026.720.0 / 2026.722.0 (every scoped read denied)", () =
     });
 
     expect(_getRuntimeForTests()?.tokenSecretId).toBe(SECRET_ID);
-    expect(ctx.secrets.resolve).toHaveBeenCalledWith(SECRET_ID, {
+    expect(ctx.secrets.resolve).toHaveBeenCalledWith(
+      { type: "secret_ref", secretId: SECRET_ID, version: "latest" },
+      { companyId: COMPANY_A, configPath: "discordBotTokenRef" },
+    );
+  });
+
+  it("refuses a non-UUID string without echoing the supplied value anywhere", async () => {
+    // The host's Ajv secret-ref format accepts any string and its extractor
+    // rejects only UUID-shaped ones, so a pasted raw bot token CAN reach stored
+    // config. It must never be resolved, and never appear in health or logs.
+    const RAW = "RAW_SECRET_SENTINEL_do_not_leak";
+    const host = buildHost({ denyScopedConfig: true });
+    await definition().setup(host.ctx);
+    await definition().onConfigChanged(storedConfig({ discordBotTokenRef: RAW }), {
       companyId: COMPANY_A,
+    });
+
+    expect(_getRuntimeForTests()).toBeNull();
+    expect(host.ctx.secrets.resolve).not.toHaveBeenCalled();
+
+    const diagnostics = await definition().onHealth();
+    expect(diagnostics.status).toBe("degraded");
+    expect(diagnostics.message).toMatch(/discordBotTokenRef/);
+    expect(host.everythingSaid(diagnostics)).not.toContain(RAW);
+  });
+
+  it("scrubs a supplied reference back out of a host error before publishing it", async () => {
+    // The host interpolates the reference it rejected into its error message.
+    // Whatever we handed it must not travel back out through health or the logs.
+    const SUPPLIED_ID = "99999999-9999-4999-8999-999999999999";
+    const host = buildHost({ denyScopedConfig: true });
+    host.ctx.secrets.resolve.mockImplementation(async (ref: unknown) => {
+      throw new Error(
+        `Invalid secret reference for plugin: ${JSON.stringify(ref)}. Use { type: "secret_ref", secretId, version? }`,
+      );
+    });
+    await definition().setup(host.ctx);
+    await definition().onConfigChanged(
+      storedConfig({ discordBotTokenRef: { type: "secret_ref", secretId: SUPPLIED_ID } }),
+      { companyId: COMPANY_A },
+    );
+
+    const diagnostics = await definition().onHealth();
+    const said = host.everythingSaid(diagnostics);
+    expect(said).not.toContain(SUPPLIED_ID);
+    expect(said).toContain("[redacted]");
+  });
+
+  it("identifies the delivered company by scoped probe, not by list order", async () => {
+    // The v2026.720/722 SDKs call onConfigChanged(config) with NO context, but the
+    // host still scopes the invocation to the real company and denies a read for
+    // any other one. Guessing companies[0] asks for the wrong company and gets
+    // denied, even though a perfectly good config was just delivered.
+    const host = buildHost({
+      companies: [COMPANY_A, COMPANY_B],
+      rows: { [COMPANY_B]: storedConfig() },
+      enforceInvocationScope: true,
+    });
+    await definition().setup(host.ctx);
+    expect(_getRuntimeForTests()).toBeNull();
+
+    host.setInvocationScope(COMPANY_B);
+    // Legacy one-argument delivery: no context object at all.
+    await definition().onConfigChanged(storedConfig());
+    host.setInvocationScope(null);
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
+    expect(host.ctx.secrets.resolve).toHaveBeenCalledWith(expect.anything(), {
+      companyId: COMPANY_B,
       configPath: "discordBotTokenRef",
     });
   });
 
-  it("resolves a scope itself when the host delivers an instance-global save", async () => {
-    const { ctx } = buildHost({ denyScopedConfig: true });
+  it("degrades with a clear message when no company scope can be identified", async () => {
+    const { ctx } = buildHost({ companies: [COMPANY_A, COMPANY_B], denyScopedConfig: true });
     await definition().setup(ctx);
 
-    // companyId null = instance/global save. `secrets.resolve` still needs a scope.
     await definition().onConfigChanged(storedConfig(), { companyId: null });
 
-    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
-    expect(ctx.secrets.resolve).toHaveBeenCalledWith(expect.anything(), {
-      companyId: COMPANY_A,
-      configPath: "discordBotTokenRef",
-    });
+    expect(_getRuntimeForTests()).toBeNull();
+    const diagnostics = await definition().onHealth();
+    expect(diagnostics.status).toBe("degraded");
+    expect(diagnostics.message).toMatch(/company/i);
   });
 });
 
@@ -280,7 +429,6 @@ describe("host matrix: >= 2026.817.0 (proactive company scopes)", () => {
     await expect(definition().setup(ctx)).resolves.toBeUndefined();
     expect(_getRuntimeForTests()).toBeNull();
 
-    // and still bootstraps when the host delivers scoped config afterwards
     await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
   });
@@ -301,38 +449,130 @@ describe("re-bootstrap on configuration changes", () => {
     expect(_getRuntimeForTests()?.defaultChannelId).toBe("999999999999999999");
   });
 
+  it("keeps the runtime object identity so a reused gateway sees the new config", async () => {
+    // The gateway's callbacks are created once, at connect time. If a same-token
+    // save swapped in a NEW runtime object, those callbacks would keep serving the
+    // superseded configuration for the life of the connection.
+    const { ctx } = buildHost();
+    await definition().setup(ctx);
+    const before = _getRuntimeForTests();
+
+    await definition().onConfigChanged(
+      storedConfig({ paperclipBaseUrl: "http://example.invalid:9999" }),
+      { companyId: COMPANY_A },
+    );
+
+    const after = _getRuntimeForTests();
+    expect(after).toBe(before);
+    expect(after?.baseUrl).toBe("http://example.invalid:9999");
+    expect(after?.cmdCtx.baseUrl).toBe("http://example.invalid:9999");
+    expect(gatewayConnects).toHaveLength(1);
+  });
+
+  it("reconnects when the message-intent set changes, in both directions", async () => {
+    // Intents are fixed when the socket identifies. Turning inbound handling on
+    // over a connection that never asked for message intents does nothing at all.
+    const { ctx } = buildHost({ rows: { [COMPANY_A]: storedConfig({ enableInbound: false }) } });
+    await definition().setup(ctx);
+    expect(gatewayConnects).toHaveLength(1);
+    expect(gatewayConnects[0].options.listenForMessages).toBe(false);
+
+    await definition().onConfigChanged(storedConfig({ enableInbound: true }), {
+      companyId: COMPANY_A,
+    });
+    expect(gatewayConnects).toHaveLength(2);
+    expect(gatewayConnects[1].options.listenForMessages).toBe(true);
+    expect(liveGateways()).toHaveLength(1);
+
+    await definition().onConfigChanged(storedConfig({ enableInbound: false }), {
+      companyId: COMPANY_A,
+    });
+    expect(gatewayConnects).toHaveLength(3);
+    expect(gatewayConnects[2].options.listenForMessages).toBe(false);
+    expect(liveGateways()).toHaveLength(1);
+  });
+
   it("tears the gateway down and reconnects when the bot token changes", async () => {
     const { ctx } = buildHost();
     await definition().setup(ctx);
     ctx.secrets.resolve.mockResolvedValue("rotated-discord-bot-token");
 
     await definition().onConfigChanged(
-      storedConfig({ discordBotTokenRef: { type: "secret_ref", secretId: "44444444-4444-4444-4444-444444444444" } }),
+      storedConfig({ discordBotTokenRef: { type: "secret_ref", secretId: ROTATED_SECRET_ID } }),
       { companyId: COMPANY_A },
     );
 
     expect(gatewayCloses.count).toBe(1);
     expect(gatewayConnects).toHaveLength(2);
     expect(gatewayConnects[1].token).toBe("rotated-discord-bot-token");
+    expect(liveGateways()).toHaveLength(1);
   });
 
   it("reconnects an unchanged token when the gateway failed permanently (#71)", async () => {
     const { ctx } = buildHost();
     await definition().setup(ctx);
 
-    // Simulate the gateway giving up (fatal close code / identify budget).
-    _getRuntimeForTests()!.gatewayFailed = true;
+    // Drive the REAL onPermanentFailure the plugin installed, not a hand-set flag:
+    // a callback bound to a stale runtime would mark the wrong object.
+    liveGateways()[0].options.onPermanentFailure("Discord refused the token (4004)", { code: 4004 });
+
+    expect(_getRuntimeForTests()?.gatewayFailed).toBe(true);
+    expect((await definition().onHealth()).status).toBe("degraded");
 
     await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
 
     expect(gatewayConnects).toHaveLength(2);
+    expect(liveGateways()).toHaveLength(1);
     expect(_getRuntimeForTests()?.gatewayFailed).toBe(false);
     expect(await definition().onHealth()).toEqual({ status: "ok" });
   });
 
+  it("serializes two back-to-back saves into exactly one live gateway", async () => {
+    // Nothing serializes host->worker requests: the SDK's RPC reader dispatches
+    // without awaiting the previous call. Two saves whose token resolution is
+    // still pending can both reach connectGateway and leak one of the connections.
+    const host = buildHost({ rows: {} });
+    await definition().setup(host.ctx);
+    expect(_getRuntimeForTests()).toBeNull();
+
+    host.deferSecretResolution();
+    const first = definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+    const second = definition().onConfigChanged(
+      storedConfig({ defaultChannelId: "1490610083728588950" }),
+      { companyId: COMPANY_A },
+    );
+    host.releaseSecretResolution();
+    await Promise.all([first, second]);
+
+    expect(liveGateways()).toHaveLength(1);
+    // Last delivery wins.
+    expect(_getRuntimeForTests()?.defaultChannelId).toBe("1490610083728588950");
+  });
+
+  it("serializes a save that rotates the token against the save before it", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    expect(liveGateways()).toHaveLength(1);
+
+    host.deferSecretResolution();
+    host.ctx.secrets.resolve.mockImplementation(async (ref: unknown) => {
+      if (typeof ref === "string") throw new Error("string refs are rejected by the host");
+      return (ref as any).secretId === SECRET_ID ? "discord-bot-token" : "rotated-token";
+    });
+    const first = definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+    const second = definition().onConfigChanged(
+      storedConfig({ discordBotTokenRef: { type: "secret_ref", secretId: ROTATED_SECRET_ID } }),
+      { companyId: COMPANY_A },
+    );
+    host.releaseSecretResolution();
+    await Promise.all([first, second]);
+
+    expect(liveGateways()).toHaveLength(1);
+    expect(liveGateways()[0].token).toBe("rotated-token");
+    expect(_getRuntimeForTests()?.token).toBe("rotated-token");
+  });
+
   it("does not open a second gateway when a save races an in-flight bootstrap", async () => {
-    // A slow startup walk plus a config save arriving mid-flight must not produce
-    // two Discord connections (#71 exists to prevent exactly that).
     const { ctx } = buildHost();
     let releaseWalk: () => void = () => {};
     const walkGate = new Promise<void>((resolve) => { releaseWalk = resolve; });
@@ -351,8 +591,7 @@ describe("re-bootstrap on configuration changes", () => {
     await Promise.all([setupPromise, deliveryPromise]);
 
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
-    expect(gatewayConnects).toHaveLength(1);
-    expect(gatewayCloses.count).toBe(0);
+    expect(liveGateways()).toHaveLength(1);
   });
 
   it("stays bound to the running company when another company's config arrives", async () => {
