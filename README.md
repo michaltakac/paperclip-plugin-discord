@@ -168,20 +168,26 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
 
 ### Host compatibility
 
-This plugin needs a Paperclip host at **v2026.720.0 or newer**. Since
-[paperclipai/paperclip#9557](https://github.com/paperclipai/paperclip/pull/9557) the plugin SDK
-requires a company scope for every `config.get` and `secrets.resolve` call, and the plugin is built
+**Fully supported on Paperclip v2026.817.0 and newer.** The plugin works on v2026.720.0 and
+v2026.722.0 with the limitation described below; older hosts cannot resolve its secrets at all.
+
+Since [paperclipai/paperclip#9557](https://github.com/paperclipai/paperclip/pull/9557) the plugin SDK
+requires a company scope for every `config.get` and `secrets.resolve` call. The plugin is built
 around that rule: it registers its handlers at startup and starts its Discord runtime once the host
 hands it a company's configuration.
 
 | Host version | What happens |
 |---|---|
-| < v2026.720.0 | The secret-ref kill switch blocks token resolution. The plugin activates, health reports `degraded` with the host's error, and no Discord connection is made. Upgrade the host. |
-| v2026.720.0 / v2026.722.0 | The runtime starts when the host delivers the configuration — **save the plugin configuration once after installing**, and the Discord connection comes up without restarting the worker. |
-| >= v2026.817.0 | The runtime starts at worker boot: the host seeds company scopes for companies that already have a stored configuration ([#10113](https://github.com/paperclipai/paperclip/pull/10113)). |
+| < v2026.720.0 | The secret-ref kill switch blocks token resolution. The plugin activates and health reports `degraded` with the host's error, but no Discord connection is made. Upgrade the host. |
+| v2026.720.0 / v2026.722.0 | The plugin activates, and the configuration applies when you save it — **but it is not retained across a worker restart.** Those hosts only send a plugin its configuration on an operator save; replaying stored configuration at worker start arrived in v2026.817.0. After every restart of the plugin worker, open the plugin settings and save again. |
+| >= v2026.817.0 | The runtime starts at worker boot: the host seeds company scopes for companies that already have a stored configuration and replays it to the worker ([#10113](https://github.com/paperclipai/paperclip/pull/10113)). Nothing to do after an install beyond saving the configuration once. |
 
 While no configuration has reached the plugin, plugin health reports `degraded` and names the reason
 the host gave. That is the first place to look if Discord stays silent after an install.
+
+On v2026.720.0 and v2026.722.0 the SDK also delivers configuration without telling the plugin which
+company it belongs to. The plugin identifies the company itself, by probing the companies it can see
+from inside that delivery, so a multi-company install still binds to the right one.
 
 ## Troubleshooting: confirm your Paperclip host
 
@@ -281,9 +287,14 @@ Brings the Discord plugin to full parity with the Telegram plugin across 14 feat
 
 Secret-reference fields (`discordBotTokenRef`, `paperclipBoardApiKeyRef`) now accept the secret
 binding written by the settings secret picker, which is what current hosts store and validate.
-A configuration saved earlier as a bare secret UUID keeps working — nothing to do — but a host at
-v2026.720.0 or newer will not let you save one, so re-select the secret with the picker the next time
-you edit the plugin configuration.
+A configuration saved earlier as a bare secret UUID keeps working: current hosts reject a plain
+string outright, so the plugin converts it to the picker's binding before resolving it. A host at
+v2026.720.0 or newer will not let you save a bare UUID, so re-select the secret with the picker the
+next time you edit the plugin configuration.
+
+Only a secret UUID is accepted in those fields. If the raw bot token is typed in directly, the
+plugin refuses to use it and reports `degraded` health naming the field — it never sends the value
+anywhere, and never writes it to health or logs.
 
 If the plugin used to activate and now reports `degraded` health after an upgrade, read the health
 message: it carries the host's own error. The usual cause is that no configuration has been delivered
@@ -298,7 +309,8 @@ previously entered a raw bot token in the field:
 2. Open **Plugin Settings for Discord Bot** and select that secret in "Discord Bot Token" with the secret picker.
 3. Save.
 
-A raw token in that field is rejected: the host validates it as a secret reference.
+A raw token in that field is refused by the plugin, which reports `degraded` health naming the
+field rather than sending the value to the host.
 
 ## Development
 
@@ -309,7 +321,7 @@ pnpm test
 pnpm build
 ```
 
-323 tests covering formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
+533 tests covering company-scoped configuration bootstrap across host generations, formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
 
 ## Contributing
 

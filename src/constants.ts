@@ -1,7 +1,7 @@
 export const PLUGIN_ID = "paperclip-plugin-discord";
 // Keep in sync with `version` in package.json.
 // `npm version <x.y.z>` rewrites this line automatically via the `version`
-// lifecycle script (scripts/sync-plugin-version.mjs); tests/plugin-version.test.ts
+// lifecycle script (scripts/sync-plugin-version.mjs); tests/manifest-contract.test.ts
 // fails the build if the two ever drift again (issue #74).
 export const PLUGIN_VERSION = "0.9.2";
 

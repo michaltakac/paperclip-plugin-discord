@@ -7,7 +7,7 @@
  *
  * Wired as the npm `version` lifecycle script: `npm version 1.2.3` bumps
  * package.json, then this script updates src/constants.ts and stages it, so the
- * version commit carries both. tests/plugin-version.test.ts asserts the two
+ * version commit carries both. tests/manifest-contract.test.ts asserts the two
  * agree, which turns any future drift (issue #74) into a failing test.
  *
  * The constant cannot simply import package.json: tsconfig pins
