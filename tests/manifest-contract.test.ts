@@ -24,6 +24,20 @@ describe("manifest version (issue #74)", () => {
   });
 });
 
+describe("capabilities the bootstrap depends on", () => {
+  it("declares companies.read", () => {
+    // The startup walk calls `companies.list`, which the SDK maps to the
+    // `companies.read` capability (host-client-factory.ts). Without it declared,
+    // the walk is denied on every host and the plugin can only ever start from an
+    // onConfigChanged delivery.
+    expect(manifest.capabilities).toContain("companies.read");
+  });
+
+  it("declares secrets.read-ref", () => {
+    expect(manifest.capabilities).toContain("secrets.read-ref");
+  });
+});
+
 describe("secret-ref config schema (issues #61, #72)", () => {
   it("declares every secret-ref field as string OR object", () => {
     // The host validates config with Ajv against this schema BEFORE its
