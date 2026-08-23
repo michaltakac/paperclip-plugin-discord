@@ -781,6 +781,30 @@ async function handleMessageCreate(
  *
  * Never throws: every failure path degrades health and returns null.
  */
+/**
+ * Close and forget the current runtime.
+ *
+ * Used when ownership moves: the previous company's Discord connection must not
+ * outlive its ownership, least of all while the new owner's bootstrap is still
+ * fallible.
+ */
+function retireRuntime(ctx: PluginContext, reason: string): void {
+  const previous = runtime;
+  runtime = null;
+  if (!previous) return;
+  ctx.logger.info("Discord plugin retiring the previous company's runtime", {
+    companyId: previous.companyId,
+    reason,
+  });
+  if (previous.gateway) {
+    try {
+      previous.gateway.close();
+    } catch (err) {
+      ctx.logger.debug("Closing the retired Discord gateway failed", { error: summarizeError(err) });
+    }
+  }
+}
+
 /** Stable JSON, so two configurations compare equal regardless of key order. */
 function stableConfigJson(config: unknown): string {
   const normalize = (value: unknown): unknown => {
@@ -833,6 +857,10 @@ function claimOwnership(ctx: PluginContext, companyId: string, config: unknown):
         "matching the host's single-tenant rule",
       { previousCompanyId: ownerCompanyId, companyId },
     );
+    // Retire the outgoing owner FIRST. Everything after this point can fail —
+    // the new owner may not even have a secret binding — and a live connection
+    // belonging to a company that no longer owns the install is worse than none.
+    retireRuntime(ctx, `owner advanced to company ${companyId}`);
     ownerCompanyId = companyId;
     ownerConfigJson = configJson;
     refusedCompanies.delete(companyId);
@@ -1237,17 +1265,17 @@ async function ensureRuntime(
   ctx: PluginContext | null,
   companyId?: string | null,
 ): Promise<DiscordRuntime | null> {
-  if (runtime) return runtime;
   const pluginCtx = ctx ?? _pluginCtx;
-  if (!pluginCtx) return null;
 
-  // A non-owner invocation is terminal, BEFORE any retry state or read. It must
-  // not probe the owner: on 2026.720/722 the host denies a read for any company
-  // other than this invocation's, which would replace the owner's useful health
-  // reason with a scope denial and burn the retry window that the owner's own
-  // next invocation needs.
+  // A non-owner invocation is terminal, and it is refused BEFORE any runtime is
+  // handed back — a live runtime for the owner must never serve another
+  // company's invocation, or that company's activity is posted into the owner's
+  // Discord with the owner's bot token. It is refused before any retry state or
+  // read too: on 2026.720/722 the host denies a read for any company other than
+  // this invocation's, which would replace the owner's useful health reason with
+  // a scope denial and burn the retry window the owner's next invocation needs.
   if (ownerCompanyId && companyId && companyId !== ownerCompanyId) {
-    if (!refusedCompanies.has(companyId)) {
+    if (pluginCtx && !refusedCompanies.has(companyId)) {
       refusedCompanies.add(companyId);
       pluginCtx.logger.warn(
         `Discord plugin ignoring an invocation for company ${companyId}; this install serves ${ownerCompanyId}`,
@@ -1256,6 +1284,9 @@ async function ensureRuntime(
     }
     return null;
   }
+
+  if (runtime) return runtime;
+  if (!pluginCtx) return null;
 
   // Only this invocation's own company can be read, so that is the only company
   // worth probing. There is no company walk: ownership follows the host.
@@ -1671,7 +1702,11 @@ const plugin = definePlugin({
 
     ctx.jobs.register("check-escalation-timeouts", async () => {
       const jobCompanyId = await resolveCompanyId(ctx);
-      const rt = await ensureRuntime(ctx, jobCompanyId);
+      // Jobs are not company-scoped invocations: `resolveCompanyId` picks a
+      // company for state scoping, which need not be the owner. Ask for the
+      // owner's runtime rather than passing that company through the
+      // ownership gate, which would silently disable every job.
+      const rt = await ensureRuntime(ctx);
       if (!rt) return;
       const pendingIds = await collectPendingEscalationIds(ctx, jobCompanyId);
       if (pendingIds.length === 0) return;
@@ -1725,7 +1760,7 @@ const plugin = definePlugin({
 
     ctx.jobs.register("check-budget-thresholds", async () => {
       const jobCompanyId = await resolveCompanyId(ctx);
-      const rt = await ensureRuntime(ctx, jobCompanyId);
+      const rt = await ensureRuntime(ctx);
       if (!rt) return;
       const agents = await ctx.agents.list({ companyId: jobCompanyId });
 
@@ -1879,7 +1914,7 @@ const plugin = definePlugin({
 
     ctx.jobs.register("check-watches", async () => {
       const cid = await resolveCompanyId(ctx);
-      const rt = await ensureRuntime(ctx, cid);
+      const rt = await ensureRuntime(ctx);
       if (!rt) return;
       if (rt.config.enableProactiveSuggestions === false) {
         ctx.logger.debug("check-watches: proactive suggestions disabled, skipping");
@@ -2117,7 +2152,7 @@ const plugin = definePlugin({
 
     ctx.jobs.register("discord-intelligence-scan", async () => {
       const cid = await resolveCompanyId(ctx);
-      const rt = await ensureRuntime(ctx, cid);
+      const rt = await ensureRuntime(ctx);
       if (!rt) return;
       if (!rt.config.enableIntelligence || rt.intelligenceChannelIds.length === 0 || !rt.defaultGuildId) {
         ctx.logger.debug("discord-intelligence-scan: intelligence disabled or no channels configured, skipping");
@@ -2142,7 +2177,7 @@ const plugin = definePlugin({
 
     ctx.actions.register("trigger-backfill", async () => {
       const cid = await resolveCompanyId(ctx);
-      const rt = await ensureRuntime(ctx, cid);
+      const rt = await ensureRuntime(ctx);
       if (!rt) return { ok: false, error: RUNTIME_NOT_READY_MESSAGE };
       if (!rt.config.enableIntelligence || rt.intelligenceChannelIds.length === 0 || !rt.defaultGuildId) {
         return { ok: false, error: "Intelligence is disabled or no intelligence channels are configured." };

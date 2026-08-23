@@ -332,7 +332,7 @@ pnpm test
 pnpm build
 ```
 
-537 tests covering company-scoped configuration bootstrap across host generations, formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
+539 tests covering company-scoped configuration bootstrap across host generations, formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
 
 ## Contributing
 

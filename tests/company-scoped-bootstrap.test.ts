@@ -592,6 +592,62 @@ describe("host matrix: >= 2026.817.0 (host replays stored configuration)", () =>
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
   });
 
+  it("refuses a non-owner invocation even while the owner's runtime is live", async () => {
+    // A is running. A company-B event must not be served A's runtime: it would
+    // post B's activity into A's Discord, with A's bot token and A's channel.
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig({ notifyOnIssueCreated: true }));
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+
+    host.ctx.http.fetch.mockClear();
+    host.ctx.logger.warn.mockClear();
+    await host.emitEvent("issue.created", COMPANY_B);
+
+    const discordCalls = host.ctx.http.fetch.mock.calls.filter(
+      (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
+    );
+    expect(discordCalls).toHaveLength(0);
+    expect(host.ctx.logger.warn).toHaveBeenCalledTimes(1);
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(`this install serves ${COMPANY_A}`),
+      expect.objectContaining({ invokingCompanyId: COMPANY_B }),
+    );
+
+    // The owner's own events still post.
+    host.ctx.http.fetch.mockClear();
+    await host.emitEvent("issue.created", COMPANY_A);
+    expect(
+      host.ctx.http.fetch.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
+      ).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("retires the previous owner before an equal-config advance can fail", async () => {
+    // The equal-config advance moves ownership to B before any B-scoped work. If
+    // B's secret cannot resolve — the duplicate-row case, where only A has the
+    // secret binding — A must already be retired: leaving A's gateway live under
+    // owner B is a connection nobody owns.
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
+
+    const duplicated = storedConfig();
+    await host.deliver(COMPANY_A, duplicated);
+    expect(liveGateways()).toHaveLength(1);
+
+    host.ctx.secrets.resolve.mockRejectedValue(
+      new Error("Secret binding not found for company"),
+    );
+    await host.deliver(COMPANY_B, { ...duplicated });
+
+    expect(liveGateways()).toHaveLength(0);
+    expect(_getRuntimeForTests()).toBeNull();
+    const diagnostics = await definition().onHealth();
+    expect(diagnostics.status).toBe("degraded");
+    expect(diagnostics.details).toMatchObject({ companyId: COMPANY_B });
+  });
+
   it("recovers the owner on its next valid save after a failed bootstrap", async () => {
     const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
     await definition().setup(host.ctx);
