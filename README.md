@@ -180,26 +180,25 @@ hands it a company's configuration.
 |---|---|
 | < v2026.720.0 | The secret-ref kill switch blocks token resolution. The plugin activates and health reports `degraded` with the host's error, but no Discord connection is made. Upgrade the host. |
 | v2026.720.0 / v2026.722.0 | The plugin activates, and the configuration applies when you save it — **but it is not retained across a worker restart.** Those hosts only send a plugin its configuration on an operator save; replaying stored configuration at worker start arrived in v2026.817.0. After every restart of the plugin worker, open the plugin settings and save again. |
-| >= v2026.817.0 | The runtime starts at worker boot: the host seeds company scopes for companies that already have a stored configuration and replays it to the worker ([#10092](https://github.com/paperclipai/paperclip/pull/10092), [#10113](https://github.com/paperclipai/paperclip/pull/10113)). Nothing to do after an install beyond saving the configuration once. |
+| >= v2026.817.0 | The runtime starts at worker boot: the host replays each company's stored configuration to the worker ([#10092](https://github.com/paperclipai/paperclip/pull/10092), [#10113](https://github.com/paperclipai/paperclip/pull/10113)). Nothing to do after an install beyond saving the configuration once. |
 
 While no configuration has reached the plugin, plugin health reports `degraded` and names the reason
 the host gave. That is the first place to look if Discord stays silent after an install.
 
 On v2026.720.0 and v2026.722.0 the SDK also delivers configuration without telling the plugin which
-company it belongs to. The plugin identifies the company itself, by probing the companies it can see
-from inside that delivery, so a multi-company install still binds to the right one.
+company it belongs to. The plugin identifies the company itself, by probing from inside that delivery
+— only the delivered company answers — so a multi-company install still binds to the right one.
 
-This plugin is single-tenant: one install serves one company. When several companies have a stored
-configuration, it binds to the same one the host would — the first company with a stored configuration row, ordered by company ID,
-which is the first the host replays at startup
-([#10092](https://github.com/paperclipai/paperclip/pull/10092)) — and logs configuration for any
-other company rather than rebinding or disturbing the running one. Running Discord for a second
-company needs a second plugin install.
+This plugin is single-tenant: one install serves one company — the company whose configuration the
+host delivers first. On v2026.817.0 and newer the host replays stored configuration when the worker
+starts, so that happens by itself; on v2026.720.0 / v2026.722.0 save the configuration once after
+installing and again after a worker restart. Configuration for any other company is logged and
+ignored rather than rebinding the plugin or disturbing the running one, and running Discord for a
+second company needs a second plugin install.
 
-If that owning company's configuration cannot start the plugin (for example its bot-token secret was
-deleted), the plugin reports `degraded` health naming that company rather than binding to a different
-one. Binding elsewhere would leave the plugin serving a company the host does not consider the owner,
-and every later configuration change would be refused.
+If the owning company's configuration cannot start the plugin (for example its bot-token secret was
+deleted), health reports `degraded` naming that company and the plugin waits for a corrected
+configuration rather than binding somewhere else.
 
 ## Troubleshooting: confirm your Paperclip host
 
@@ -333,7 +332,7 @@ pnpm test
 pnpm build
 ```
 
-543 tests covering company-scoped configuration bootstrap across host generations, formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
+537 tests covering company-scoped configuration bootstrap across host generations, formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
 
 ## Contributing
 

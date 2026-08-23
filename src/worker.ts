@@ -161,21 +161,18 @@ const RUNTIME_NOT_READY_MESSAGE =
 // starts: an unscoped `ctx.config.get()` in setup() throws and kills activation.
 //
 // setup() therefore only registers handlers. Everything that needs config or a
-// secret lives in this runtime, which is bootstrapped later from whichever of
-// these happens first:
-//   1. `onConfigChanged` — the host delivers stored config with its scope, both
-//      at startup and on every save (the only path that works on 2026.720/722);
-//   2. the first company-scoped invocation (event, job, tool, action);
-//   3. a best-effort startup walk over `companies.list()` at the end of setup()
-//      (works from 2026.817.0, where the host seeds proactive company scopes).
+// secret lives in this runtime, and there are exactly TWO ways it starts:
+//   1. `onConfigChanged` — the host delivers stored config with its scope. From
+//      v2026.817.0 the host replays stored configuration at worker start
+//      (paperclipai/paperclip#10092), and a save arrives this way on every host;
+//   2. the first company-scoped invocation (event, job, tool, action), which
+//      probes THAT invocation's own company — the only one it may read.
 //
-// Single-tenant by design: this worker serves ONE company — the first company
-// with a stored configuration row, ordered by company id. Bootstrap success does
-// not decide ownership: an owner whose bot token stopped resolving stays the
-// owner and is the only company that can start this worker. That matches the
-// host, which replays stored rows in that order and records the first delivery
-// as the single tenant. `multiCompanyConfig` stays unset, so the host also fails
-// a second company's config closed rather than silently rebinding this worker.
+// The plugin does not go looking for an owner. Ownership follows the host: the
+// first company whose configuration arrives owns this install, and any other
+// company is logged and refused — except for the host's own equal-config rule,
+// mirrored in `claimOwnership`. `multiCompanyConfig` stays unset, so the host
+// also fails a second company's config closed rather than rebinding this worker.
 
 type DiscordRuntime = {
   companyId: string;
@@ -243,19 +240,12 @@ let lastScopedConfigError: string | null = null;
  */
 let ownerCompanyId: string | null = null;
 /**
- * Company enumeration for the startup walk.
- *
- * One snapshot request, never offset paging: the host re-runs the whole company
- * query per request and slices it in memory (`applyWindow` in
- * server/src/services/plugin-host-services.ts), and the underlying query has no
- * ORDER BY — so rows can move between two requests and paged reads cannot prove
- * they saw the whole set. Asking for one more than the cap is what tells us the
- * set is too large to enumerate safely.
+ * The configuration last accepted for the owner, for the host's equal-config rule
+ * (see `claimOwnership`). Stored as stable JSON so comparison is order-insensitive.
  */
-const COMPANY_SNAPSHOT_CAP = 1000;
-const COMPANY_SNAPSHOT_REQUEST = COMPANY_SNAPSHOT_CAP + 1;
-/** How far into the sorted set ownership selection will probe. */
-const COMPANY_PROBE_LIMIT = 25;
+let ownerConfigJson: string | null = null;
+/** Companies already refused; keeps a chatty non-owner from flooding the log. */
+const refusedCompanies = new Set<string>();
 /** Opportunistic bootstrap attempts are rate-limited; onConfigChanged bypasses this. */
 const BOOTSTRAP_RETRY_COOLDOWN_MS = 60_000;
 let nextOpportunisticBootstrapAt = 0;
@@ -284,6 +274,8 @@ export function _resetRuntimeForTests(): void {
   bootstrapQueue = Promise.resolve();
   lastScopedConfigError = null;
   ownerCompanyId = null;
+  ownerConfigJson = null;
+  refusedCompanies.clear();
   nextOpportunisticBootstrapAt = 0;
   seenEvents.clear();
   runtimeHealth = {
@@ -789,23 +781,71 @@ async function handleMessageCreate(
  *
  * Never throws: every failure path degrades health and returns null.
  */
+/** Stable JSON, so two configurations compare equal regardless of key order. */
+function stableConfigJson(config: unknown): string {
+  const normalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(normalize);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          .map(([key, entry]) => [key, normalize(entry)]),
+      );
+    }
+    return value;
+  };
+  return JSON.stringify(normalize(config));
+}
+
 /**
  * The single ownership gate. Every bootstrap source goes through it.
  *
- * The first company known to have a stored configuration row claims the worker;
- * afterwards, any other company is logged and refused. Claiming does not require
- * the runtime to start — that is the whole point of tracking it separately.
+ * The first company whose configuration reaches this worker claims it. Claiming
+ * does not require the runtime to start — an owner whose bot token stopped
+ * resolving stays the owner, so a later company cannot take the install over
+ * while the real owner is broken.
+ *
+ * One exception, mirroring the host exactly: the SDK's single-tenant guard
+ * ACCEPTS an identical configuration under a different company and advances its
+ * recorded company to that one (`worker-rpc-host.ts`). That is deployed state,
+ * not a malformed row — migration 0164 duplicated each unbound legacy plugin
+ * config unchanged across every company. Refusing it here would leave the plugin
+ * owning A while the SDK owns B, which is precisely the split this gate exists to
+ * prevent, so an equal-config delivery advances the owner too.
  */
-function claimOwnership(ctx: PluginContext, companyId: string): boolean {
+function claimOwnership(ctx: PluginContext, companyId: string, config: unknown): boolean {
+  const configJson = stableConfigJson(config);
+
   if (!ownerCompanyId) {
     ownerCompanyId = companyId;
+    ownerConfigJson = configJson;
     return true;
   }
-  if (ownerCompanyId === companyId) return true;
-  ctx.logger.warn(
-    `Discord plugin ignoring configuration for company ${companyId}; this install serves ${ownerCompanyId}`,
-    { runningCompanyId: ownerCompanyId, deliveredCompanyId: companyId },
-  );
+
+  if (ownerCompanyId === companyId) {
+    ownerConfigJson = configJson;
+    return true;
+  }
+
+  if (ownerConfigJson !== null && ownerConfigJson === configJson) {
+    ctx.logger.info(
+      `Discord plugin owner advancing from company ${ownerCompanyId} to ${companyId}: identical configuration, ` +
+        "matching the host's single-tenant rule",
+      { previousCompanyId: ownerCompanyId, companyId },
+    );
+    ownerCompanyId = companyId;
+    ownerConfigJson = configJson;
+    refusedCompanies.delete(companyId);
+    return true;
+  }
+
+  if (!refusedCompanies.has(companyId)) {
+    refusedCompanies.add(companyId);
+    ctx.logger.warn(
+      `Discord plugin ignoring configuration for company ${companyId}; this install serves ${ownerCompanyId}`,
+      { runningCompanyId: ownerCompanyId, deliveredCompanyId: companyId },
+    );
+  }
   return false;
 }
 
@@ -836,7 +876,7 @@ async function bootstrapRuntime(
   companyId: string,
   rawConfig: unknown,
 ): Promise<DiscordRuntime | null> {
-  if (!claimOwnership(ctx, companyId)) return runtime;
+  if (!claimOwnership(ctx, companyId, rawConfig)) return runtime;
   const existing = runtime;
 
   const config = {
@@ -1124,113 +1164,6 @@ async function bootstrapFromScopedConfig(
 }
 
 /**
- * Best-effort startup walk: find the company the host considers this worker's
- * owner, and bind to that one or to nobody.
- *
- * The owner is the lowest company id that has a stored config ROW — whether or
- * not the plugin can actually start from it. The host replays rows in that order
- * (`listConfigs` orders by `companyId` ascending) and the SDK records the first
- * delivery as the single-tenant owner, refusing every different company
- * afterwards. So "readable row found" decides ownership; "runtime started" does
- * not. Skipping an owner whose secret no longer resolves in order to bind the
- * next company would leave a live gateway for a company the host does not
- * consider the owner: that company's own replay and every later save would be
- * refused, and it would run indefinitely on stale configuration.
- *
- * Probing stops after COMPANY_PROBE_LIMIT companies. That prefix is a true
- * prefix of the same sorted set the host replays from, so an owner found inside
- * it is the host's owner too; if the first configured company sits beyond it, the
- * walk adopts nobody and waits for the delivery.
- */
-async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRuntime | null> {
-  // An owner selected earlier stays the owner, even if it never started.
-  if (ownerCompanyId) return bootstrapFromScopedConfig(ctx, ownerCompanyId);
-
-  const companyIds = await listAllCompanyIds(ctx);
-  if (!companyIds) return null;
-
-  const probeSet = companyIds.slice(0, COMPANY_PROBE_LIMIT);
-  for (const companyId of probeSet) {
-    const rawConfig = await readScopedConfig(ctx, companyId);
-    if (!rawConfig || Object.keys(rawConfig).length === 0) continue;
-
-    // This company owns the worker. Bind to it or to nobody.
-    const started = await bootstrapRuntime(ctx, companyId, rawConfig);
-    if (!started) {
-      // bootstrapRuntime has already degraded health naming this company's
-      // problem; falling through to another company would bind the wrong owner.
-      ctx.logger.warn(
-        "Discord plugin could not start from its owning company's configuration; " +
-          "not falling back to another company",
-        { companyId },
-      );
-    }
-    return started;
-  }
-
-  if (companyIds.length > probeSet.length) {
-    ctx.logger.info("Startup walk found no configured company within its probe limit; waiting for a delivery", {
-      probed: probeSet.length,
-      companies: companyIds.length,
-    });
-  } else {
-    degradeHealth(
-      "No company has a stored configuration for this plugin yet. Save the plugin configuration to activate it.",
-      "discord-awaiting-company-config",
-    );
-  }
-  return null;
-}
-
-/**
- * Every company id the host will show us, ordered the way the host's own startup
- * replay is ordered.
- *
- * This ordering is the whole point. From v2026.817.0 the host replays each stored
- * config row to a freshly started worker (paperclipai/paperclip#10092, commit
- * 1ebf5254b), and `listConfigs` orders those rows by `companyId` ascending
- * (server/src/services/plugin-registry.ts), so the first row the host replays —
- * the one a single-tenant worker binds to — belongs to the lowest company id that
- * has a configuration. If this walk adopted a different company, the plugin and
- * the host would disagree about who owns the worker, and every later delivery for
- * the host's choice would be refused as cross-tenant.
- *
- * Returns null when ownership cannot be selected safely: the caller then waits
- * for the host to deliver a configuration instead of guessing.
- */
-async function listAllCompanyIds(ctx: PluginContext): Promise<string[] | null> {
-  let rows: Array<{ id: string }>;
-  try {
-    // One request, one consistent view. Asking for CAP + 1 makes "too many to
-    // enumerate" detectable without a second, unrelatable query.
-    rows = await ctx.companies.list({ limit: COMPANY_SNAPSHOT_REQUEST, offset: 0 });
-  } catch (err) {
-    ctx.logger.info("Could not list companies; waiting for a config delivery", {
-      error: summarizeError(err),
-    });
-    return null;
-  }
-
-  if (rows.length > COMPANY_SNAPSHOT_CAP) {
-    ctx.logger.warn(
-      "Discord plugin sees more companies than it will enumerate; skipping startup company selection " +
-        "and waiting for the host to deliver a configuration",
-      { cap: COMPANY_SNAPSHOT_CAP },
-    );
-    return null;
-  }
-
-  const ids: string[] = [];
-  for (const company of rows) {
-    if (company?.id) ids.push(company.id);
-  }
-  // Byte-order ascending, matching the host's `asc(companyId)`. Explicit
-  // comparator: the default sort is fine for ASCII ids but says nothing about
-  // locale-sensitive collation.
-  return ids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-}
-
-/**
  * Identify which company a context-less config delivery belongs to.
  *
  * The v2026.720.0 and v2026.722.0 SDKs call `onConfigChanged(config)` with no
@@ -1247,13 +1180,23 @@ async function identifyDeliveredCompany(
   ctx: PluginContext,
   deliveredConfig: unknown,
 ): Promise<string | null> {
-  // Not limited to the ownership probe prefix: the delivered company can sit
-  // anywhere in the sorted set, and the set is already bounded by the snapshot cap.
-  const companyIds = (await listAllCompanyIds(ctx)) ?? [];
+  // On the hosts where this path runs (2026.720/722), `companies.list` is filtered
+  // to the invocation's own company, so this is a one-element list in practice;
+  // the scoped probe below is what actually identifies the delivery.
+  let companies: Array<{ id: string }>;
+  try {
+    companies = await ctx.companies.list();
+  } catch (err) {
+    ctx.logger.info("Could not list companies while attributing a configuration delivery", {
+      error: summarizeError(err),
+    });
+    return null;
+  }
+
   const readable: Array<{ id: string; config: Record<string, unknown> }> = [];
-  for (const companyId of companyIds) {
-    const config = await readScopedConfig(ctx, companyId);
-    if (config) readable.push({ id: companyId, config });
+  for (const company of companies) {
+    const config = await readScopedConfig(ctx, company.id);
+    if (config) readable.push({ id: company.id, config });
   }
 
   if (readable.length === 0) return null;
@@ -1297,6 +1240,28 @@ async function ensureRuntime(
   if (runtime) return runtime;
   const pluginCtx = ctx ?? _pluginCtx;
   if (!pluginCtx) return null;
+
+  // A non-owner invocation is terminal, BEFORE any retry state or read. It must
+  // not probe the owner: on 2026.720/722 the host denies a read for any company
+  // other than this invocation's, which would replace the owner's useful health
+  // reason with a scope denial and burn the retry window that the owner's own
+  // next invocation needs.
+  if (ownerCompanyId && companyId && companyId !== ownerCompanyId) {
+    if (!refusedCompanies.has(companyId)) {
+      refusedCompanies.add(companyId);
+      pluginCtx.logger.warn(
+        `Discord plugin ignoring an invocation for company ${companyId}; this install serves ${ownerCompanyId}`,
+        { runningCompanyId: ownerCompanyId, invokingCompanyId: companyId },
+      );
+    }
+    return null;
+  }
+
+  // Only this invocation's own company can be read, so that is the only company
+  // worth probing. There is no company walk: ownership follows the host.
+  const target = companyId ?? ownerCompanyId;
+  if (!target) return null;
+
   if (bootstrapInFlight) return bootstrapInFlight;
   if (Date.now() < nextOpportunisticBootstrapAt) return null;
   nextOpportunisticBootstrapAt = Date.now() + BOOTSTRAP_RETRY_COOLDOWN_MS;
@@ -1304,22 +1269,7 @@ async function ensureRuntime(
   bootstrapInFlight = queueBootstrap(async () => {
     try {
       if (runtime) return runtime;
-      if (ownerCompanyId) {
-        // The owner is known. A different company's invocation can never claim
-        // the worker; it only gives us another chance to recover the owner.
-        if (companyId && companyId !== ownerCompanyId) {
-          claimOwnership(pluginCtx, companyId);
-        }
-        return await bootstrapFromScopedConfig(pluginCtx, ownerCompanyId);
-      }
-      // No owner yet: let the walk select one from the stored rows rather than
-      // letting whichever company happened to invoke us claim the worker.
-      const walked = await bootstrapFromStartupWalk(pluginCtx);
-      if (walked || ownerCompanyId) return walked;
-      if (companyId) {
-        return await bootstrapFromScopedConfig(pluginCtx, companyId);
-      }
-      return null;
+      return await bootstrapFromScopedConfig(pluginCtx, target);
     } catch (err) {
       pluginCtx.logger.warn("Discord plugin bootstrap attempt failed", { error: summarizeError(err) });
       return null;
@@ -2212,20 +2162,10 @@ const plugin = definePlugin({
       return { ok: true, signalsFound: signals.length };
     });
 
-    // Best-effort startup walk: on a host that seeds proactive company scopes
-    // (>= 2026.817.0) this starts the runtime right away. On 2026.720/722 it is
-    // denied for every company and the plugin waits for onConfigChanged instead.
-    // It must never throw: a throw here fails worker activation.
-    try {
-      await ensureRuntime(ctx);
-    } catch (err) {
-      ctx.logger.warn("Discord plugin startup bootstrap failed", { error: summarizeError(err) });
-    }
-
-    ctx.logger.info("Discord plugin setup complete", {
-      runtimeStarted: runtime !== null,
-      companyId: runtime?.companyId,
-    });
+    // Registration is all setup() does. The runtime starts when the host delivers
+    // configuration (>= v2026.817.0 replays it at worker start; a save arrives
+    // this way on every host) or on the first company-scoped invocation.
+    ctx.logger.info("Discord plugin registered; waiting for configuration");
   },
 
   async onWebhook(input: PluginWebhookInput): Promise<void> {

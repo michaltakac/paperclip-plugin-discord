@@ -217,8 +217,16 @@ function buildHost(options: HostOptions = {}) {
   return {
     ctx,
     unscopedConfigReads,
-    /** Deliver an event to the plugin, as a company-scoped invocation. */
+    /** Deliver an event to the plugin as a real company-scoped invocation. */
     async emitEvent(eventType: string, companyId: string) {
+      invocationScope = companyId;
+      try {
+        await this.deliverEvent(eventType, companyId);
+      } finally {
+        invocationScope = null;
+      }
+    },
+    async deliverEvent(eventType: string, companyId: string) {
       for (const handler of eventHandlers.get(eventType) ?? []) {
         await handler({
           eventId: `evt-${Math.random().toString(36).slice(2)}`,
@@ -234,6 +242,22 @@ function buildHost(options: HostOptions = {}) {
     /** Enter or leave a host->worker invocation bound to a company. */
     setInvocationScope(companyId: string | null) {
       invocationScope = companyId;
+    },
+    /**
+     * The host's configChanged RPC: a company-scoped invocation carrying the
+     * stored configuration. This is how a runtime starts on every host now.
+     */
+    async deliver(companyId: string, config: Record<string, unknown>, opts?: { withContext?: boolean }) {
+      invocationScope = companyId;
+      try {
+        if (opts?.withContext === false) {
+          await definition().onConfigChanged(config);
+        } else {
+          await definition().onConfigChanged(config, { companyId });
+        }
+      } finally {
+        invocationScope = null;
+      }
     },
     /** Hold every subsequent token resolution until releaseSecretResolution(). */
     deferSecretResolution() {
@@ -270,9 +294,10 @@ beforeEach(() => {
 
 describe("host matrix: pre-2026.720.0 (secret-ref kill switch)", () => {
   it("keeps the worker activated, degrades health, and reports the host's real error", async () => {
-    const { ctx } = buildHost({ secretsKillSwitch: true });
+    const host = buildHost({ secretsKillSwitch: true });
 
-    await expect(definition().setup(ctx)).resolves.toBeUndefined();
+    await expect(definition().setup(host.ctx)).resolves.toBeUndefined();
+    await host.deliver(COMPANY_A, storedConfig());
 
     expect(_getRuntimeForTests()).toBeNull();
     const diagnostics = await definition().onHealth();
@@ -447,240 +472,162 @@ describe("host matrix: 2026.720.0 / 2026.722.0 (every scoped read denied)", () =
   });
 });
 
-describe("host matrix: >= 2026.817.0 (proactive company scopes)", () => {
-  it("starts the runtime from the startup walk during setup()", async () => {
-    const { ctx, unscopedConfigReads } = buildHost();
-
-    await definition().setup(ctx);
-
-    expect(unscopedConfigReads).toHaveLength(0);
-    expect(ctx.config.get).toHaveBeenCalledWith(COMPANY_A);
-    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
-    expect(await definition().onHealth()).toEqual({ status: "ok" });
-  });
-
-  it("binds the host's owner, or nobody — never a later company", async () => {
-    // The owner is the lowest company id with a stored config ROW, whether or not
-    // the plugin can start from it: the host replays rows in that order and the
-    // SDK records the first delivery as the single-tenant owner. Skipping A to
-    // bind B would leave a live B gateway while the SDK owns A — B's own replay
-    // and every later save would then be refused, and B would run forever on
-    // stale config. A's row is present here but its secret no longer resolves.
-    const { ctx } = buildHost({
-      companies: [COMPANY_A, COMPANY_B],
-      rows: {
-        [COMPANY_A]: storedConfig({ discordBotTokenRef: "" }),
-        [COMPANY_B]: storedConfig(),
-      },
-    });
-
-    await definition().setup(ctx);
-
-    expect(_getRuntimeForTests()).toBeNull();
-    expect(gatewayConnects).toHaveLength(0);
-    // B was never probed, let alone bootstrapped.
-    expect(ctx.config.get).not.toHaveBeenCalledWith(COMPANY_B);
-
-    const diagnostics = await definition().onHealth();
-    expect(diagnostics.status).toBe("degraded");
-    expect(diagnostics.details).toMatchObject({ companyId: COMPANY_A });
-  });
-
-  it("refuses to bind a non-owner even when a scoped invocation offers one", async () => {
-    // A owns the worker (lowest company id with a stored row) but its secret no
-    // longer resolves. A company-B event must not sneak B in through the
-    // opportunistic bootstrap: the host would still replay A first and refuse
-    // every B delivery afterwards, leaving B running forever on stale config.
-    const host = buildHost({
-      companies: [COMPANY_A, COMPANY_B],
-      rows: {
-        [COMPANY_A]: storedConfig({ discordBotTokenRef: "" }),
-        [COMPANY_B]: storedConfig(),
-      },
-    });
+describe("host matrix: >= 2026.817.0 (host replays stored configuration)", () => {
+  it("starts from the host's startup replay, with no company walk of its own", async () => {
+    // The plugin does not go looking for an owner. From v2026.817.0 the host
+    // replays each stored configuration row to the fresh worker; the first one
+    // to arrive owns this install.
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
 
     await definition().setup(host.ctx);
-    expect(_getRuntimeForTests()).toBeNull();
-
-    // A's startup replay arrives and still fails — which also clears the
-    // opportunistic retry cooldown, so the next invocation may bootstrap.
-    await definition().onConfigChanged(storedConfig({ discordBotTokenRef: "" }), {
-      companyId: COMPANY_A,
-    });
-    expect(_getRuntimeForTests()).toBeNull();
-
-    await host.emitEvent("issue.created", COMPANY_B);
-
-    expect(_getRuntimeForTests()).toBeNull();
-    expect(gatewayConnects).toHaveLength(0);
-    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining(`this install serves ${COMPANY_A}`),
-      expect.anything(),
-    );
-  });
-
-  it("recovers the owner on its next valid save, after a failed bootstrap", async () => {
-    const host = buildHost({
-      companies: [COMPANY_A, COMPANY_B],
-      rows: {
-        [COMPANY_A]: storedConfig({ discordBotTokenRef: "" }),
-        [COMPANY_B]: storedConfig(),
-      },
-    });
-
-    await definition().setup(host.ctx);
-    await host.emitEvent("issue.created", COMPANY_B);
-    expect(_getRuntimeForTests()).toBeNull();
-
-    // A is repaired and saved.
-    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
-
-    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
-    expect(await definition().onHealth()).toEqual({ status: "ok" });
-  });
-
-  it("lets the first delivered company own a fresh install with no configured rows", async () => {
-    // Nothing is configured yet, so the walk selects no owner. The first
-    // scoped delivery is then the owner.
-    const { ctx } = buildHost({ companies: [COMPANY_A, COMPANY_B], rows: {} });
-
-    await definition().setup(ctx);
-    expect(_getRuntimeForTests()).toBeNull();
-
-    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_B });
-
-    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
-
-    // And A cannot take it over afterwards.
-    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
-    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
-  });
-
-  it("starts from the owner when its configuration is usable", async () => {
-    const { ctx } = buildHost({
-      companies: [COMPANY_A, COMPANY_B],
-      rows: { [COMPANY_A]: storedConfig(), [COMPANY_B]: storedConfig() },
-    });
-
-    await definition().setup(ctx);
-
-    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
-    expect(ctx.config.get).not.toHaveBeenCalledWith(COMPANY_B);
-  });
-
-  it("adopts the same company the host's startup replay would, across pages", async () => {
-    // From v2026.817.0 the host replays stored config rows to a fresh worker in
-    // `asc(companyId)` order (plugin-registry.listConfigs), and a single-tenant
-    // worker binds to the first row. If this walk adopted a different company,
-    // the plugin and the host would disagree about who owns the worker and every
-    // later delivery for the host's choice would be refused as cross-tenant.
-    // The readable configs here straddle a page boundary, and the one the host
-    // would replay first is on the SECOND page.
-    const many = Array.from({ length: 26 }, (_, i) => `z-company-${String(i).padStart(2, "0")}`);
-    many.push("a-company");
-    const { ctx } = buildHost({
-      companies: many,
-      rows: {
-        "z-company-00": storedConfig(),
-        "a-company": storedConfig(),
-      },
-    });
-
-    await definition().setup(ctx);
-
-    expect(_getRuntimeForTests()?.companyId).toBe("a-company");
-  });
-
-  it("enumerates companies with a single snapshot request, never offset paging", async () => {
-    // The host re-runs the whole company query per request and slices it in
-    // memory (applyWindow), and that query has no ORDER BY — so two paged reads
-    // cannot be related to each other and cannot prove the set was fully seen.
-    const many = Array.from({ length: 250 }, (_, i) => `company-${String(i).padStart(3, "0")}`);
-    const { ctx } = buildHost({ companies: many, rows: { "company-000": storedConfig() } });
-
-    await definition().setup(ctx);
-
-    expect(ctx.companies.list).toHaveBeenCalledTimes(1);
-    expect(ctx.companies.list).toHaveBeenCalledWith({ limit: 1001, offset: 0 });
-    expect(_getRuntimeForTests()?.companyId).toBe("company-000");
-  });
-
-  it("selects no owner and probes nothing when the tenant exceeds the snapshot cap", async () => {
-    const many = Array.from({ length: 1001 }, (_, i) => `company-${String(i).padStart(4, "0")}`);
-    const { ctx } = buildHost({ companies: many, rows: { "company-0000": storedConfig() } });
-
-    await definition().setup(ctx);
-
-    expect(_getRuntimeForTests()).toBeNull();
-    expect(ctx.config.get).not.toHaveBeenCalled();
-    expect(ctx.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("more companies than it will enumerate"),
-      expect.objectContaining({ cap: 1000 }),
-    );
-
-    // A delivery still starts it.
-    await definition().onConfigChanged(storedConfig(), { companyId: "company-0000" });
-    expect(_getRuntimeForTests()?.companyId).toBe("company-0000");
-  });
-
-  it("selects no owner when the listing itself fails", async () => {
-    const { ctx } = buildHost({ companiesThrow: true });
-
-    await definition().setup(ctx);
-
-    expect(_getRuntimeForTests()).toBeNull();
-    expect(ctx.config.get).not.toHaveBeenCalled();
-  });
-
-  it("stops probing after the prefix limit rather than binding to a late company", async () => {
-    // The probe prefix is a true prefix of the same sorted set the host replays
-    // from, so anything it adopts is the host's choice too. A configuration that
-    // sits past the limit waits for the delivery instead of being mis-adopted.
-    const many = Array.from({ length: 40 }, (_, i) => `company-${String(i).padStart(2, "0")}`);
-    const { ctx } = buildHost({ companies: many, rows: { "company-39": storedConfig() } });
-
-    await definition().setup(ctx);
-
-    expect(_getRuntimeForTests()).toBeNull();
-    expect(ctx.config.get).toHaveBeenCalledTimes(25);
-
-    await definition().onConfigChanged(storedConfig(), { companyId: "company-39" });
-    expect(_getRuntimeForTests()?.companyId).toBe("company-39");
-  });
-
-  it("fresh install: the walk finds nothing, then a config save bootstraps it", async () => {
-    const { ctx } = buildHost({ rows: {} });
-
-    await definition().setup(ctx);
     expect(_getRuntimeForTests()).toBeNull();
     expect((await definition().onHealth()).status).toBe("degraded");
+    // setup() reads nothing at all: it has no scope to read with.
+    expect(host.ctx.config.get).not.toHaveBeenCalled();
+    expect(host.ctx.companies.list).not.toHaveBeenCalled();
 
-    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+    await host.deliver(COMPANY_A, storedConfig());
 
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
     expect(await definition().onHealth()).toEqual({ status: "ok" });
   });
 
-  it("survives companies.list() failing outright", async () => {
-    const { ctx } = buildHost({ companiesThrow: true });
+  it("keeps the first replayed company and refuses a different one", async () => {
+    // Ordered replay A then B with DISTINCT configs: A owns the install and B is
+    // refused, exactly as the host's own single-tenant guard would.
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
 
-    await expect(definition().setup(ctx)).resolves.toBeUndefined();
+    await host.deliver(COMPANY_A, storedConfig());
+    await host.deliver(COMPANY_B, storedConfig({ defaultChannelId: "1490610083728588950" }));
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(_getRuntimeForTests()?.defaultChannelId).toBe("1490608926423646298");
+    expect(liveGateways()).toHaveLength(1);
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(`this install serves ${COMPANY_A}`),
+      expect.objectContaining({ deliveredCompanyId: COMPANY_B }),
+    );
+  });
+
+  it("advances the owner on an identical configuration, as the host's guard does", async () => {
+    // The SDK's single-tenant guard ACCEPTS an identical config under a different
+    // company and records that company. Migration 0164 duplicated each unbound
+    // legacy plugin config across every company, so this is deployed state. If
+    // the plugin refused it, the plugin would own A while the SDK owns B — the
+    // exact split the ownership rule exists to prevent.
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
+
+    const duplicated = storedConfig();
+    await host.deliver(COMPANY_A, duplicated);
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+
+    await host.deliver(COMPANY_B, { ...duplicated });
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
+    expect(host.ctx.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("owner advancing"),
+      expect.objectContaining({ previousCompanyId: COMPANY_A, companyId: COMPANY_B }),
+    );
+
+    // A's own later, CHANGED config is now a different company's config.
+    await host.deliver(COMPANY_A, storedConfig({ defaultChannelId: "1490610083728588950" }));
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
+
+    // B's saves still apply.
+    await host.deliver(COMPANY_B, { ...duplicated, defaultChannelId: "1490610083728588950" });
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
+    expect(_getRuntimeForTests()?.defaultChannelId).toBe("1490610083728588950");
+  });
+
+  it("bootstraps from a company-scoped invocation when no delivery has arrived", async () => {
+    // Second bootstrap source: an event carries a company scope, which is the one
+    // company this invocation may read.
+    const host = buildHost({ companies: [COMPANY_A], enforceInvocationScope: true });
+    await definition().setup(host.ctx);
     expect(_getRuntimeForTests()).toBeNull();
 
-    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+    await host.emitEvent("issue.created", COMPANY_A);
+
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(await definition().onHealth()).toEqual({ status: "ok" });
+  });
+
+  it("refuses a non-owner invocation without reading, degrading, or burning the retry slot", async () => {
+    // Owner A exists but cannot start (its secret no longer resolves). A company-B
+    // event must be terminal BEFORE any retry state or read: probing A under B's
+    // invocation is denied by the host, which would replace A's useful health
+    // reason with a scope denial and consume the retry window A's own next
+    // invocation needs.
+    const host = buildHost({
+      companies: [COMPANY_A, COMPANY_B],
+      rows: {
+        [COMPANY_A]: storedConfig(),
+        [COMPANY_B]: storedConfig(),
+      },
+      enforceInvocationScope: true,
+    });
+    await definition().setup(host.ctx);
+
+    await host.deliver(COMPANY_A, storedConfig({ discordBotTokenRef: "" }));
+    expect(_getRuntimeForTests()).toBeNull();
+    const healthAfterOwnerFailure = await definition().onHealth();
+    expect(healthAfterOwnerFailure.details).toMatchObject({ companyId: COMPANY_A });
+
+    host.ctx.config.get.mockClear();
+    await host.emitEvent("issue.created", COMPANY_B);
+
+    // No read, no health change, and no cooldown consumed.
+    expect(host.ctx.config.get).not.toHaveBeenCalled();
+    expect(await definition().onHealth()).toEqual(healthAfterOwnerFailure);
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(`this install serves ${COMPANY_A}`),
+      expect.objectContaining({ invokingCompanyId: COMPANY_B }),
+    );
+
+    // The owner's own invocation, immediately after, still re-probes A.
+    await host.emitEvent("issue.created", COMPANY_A);
+    expect(host.ctx.config.get).toHaveBeenCalledWith(COMPANY_A);
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+  });
+
+  it("recovers the owner on its next valid save after a failed bootstrap", async () => {
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
+
+    await host.deliver(COMPANY_A, storedConfig({ discordBotTokenRef: "" }));
+    expect(_getRuntimeForTests()).toBeNull();
+
+    await host.deliver(COMPANY_A, storedConfig());
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(await definition().onHealth()).toEqual({ status: "ok" });
+  });
+
+  it("lets the first delivered company own a fresh install", async () => {
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B], rows: {} });
+    await definition().setup(host.ctx);
+
+    await host.deliver(COMPANY_B, storedConfig());
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
+
+    // A cannot take it over with a different configuration.
+    await host.deliver(COMPANY_A, storedConfig({ defaultChannelId: "1490610083728588950" }));
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
   });
 });
 
+
 describe("re-bootstrap on configuration changes", () => {
   it("keeps the live gateway when the same company saves an unchanged token", async () => {
-    const { ctx } = buildHost();
+    const host = buildHost();
+    const { ctx } = host;
     await definition().setup(ctx);
+    await host.deliver(COMPANY_A, storedConfig());
     expect(gatewayConnects).toHaveLength(1);
 
-    await definition().onConfigChanged(storedConfig({ defaultChannelId: "999999999999999999" }), {
-      companyId: COMPANY_A,
-    });
+    await host.deliver(COMPANY_A, storedConfig({ defaultChannelId: "999999999999999999" }));
 
     expect(gatewayConnects).toHaveLength(1);
     expect(gatewayCloses.count).toBe(0);
@@ -691,14 +638,12 @@ describe("re-bootstrap on configuration changes", () => {
     // The gateway's callbacks are created once, at connect time. If a same-token
     // save swapped in a NEW runtime object, those callbacks would keep serving the
     // superseded configuration for the life of the connection.
-    const { ctx } = buildHost();
-    await definition().setup(ctx);
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
     const before = _getRuntimeForTests();
 
-    await definition().onConfigChanged(
-      storedConfig({ paperclipBaseUrl: "http://example.invalid:9999" }),
-      { companyId: COMPANY_A },
-    );
+    await host.deliver(COMPANY_A, storedConfig({ paperclipBaseUrl: "http://example.invalid:9999" }));
 
     const after = _getRuntimeForTests();
     expect(after).toBe(before);
@@ -710,34 +655,32 @@ describe("re-bootstrap on configuration changes", () => {
   it("reconnects when the message-intent set changes, in both directions", async () => {
     // Intents are fixed when the socket identifies. Turning inbound handling on
     // over a connection that never asked for message intents does nothing at all.
-    const { ctx } = buildHost({ rows: { [COMPANY_A]: storedConfig({ enableInbound: false }) } });
-    await definition().setup(ctx);
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig({ enableInbound: false }));
     expect(gatewayConnects).toHaveLength(1);
     expect(gatewayConnects[0].options.listenForMessages).toBe(false);
 
-    await definition().onConfigChanged(storedConfig({ enableInbound: true }), {
-      companyId: COMPANY_A,
-    });
+    await host.deliver(COMPANY_A, storedConfig({ enableInbound: true }));
     expect(gatewayConnects).toHaveLength(2);
     expect(gatewayConnects[1].options.listenForMessages).toBe(true);
     expect(liveGateways()).toHaveLength(1);
 
-    await definition().onConfigChanged(storedConfig({ enableInbound: false }), {
-      companyId: COMPANY_A,
-    });
+    await host.deliver(COMPANY_A, storedConfig({ enableInbound: false }));
     expect(gatewayConnects).toHaveLength(3);
     expect(gatewayConnects[2].options.listenForMessages).toBe(false);
     expect(liveGateways()).toHaveLength(1);
   });
 
   it("tears the gateway down and reconnects when the bot token changes", async () => {
-    const { ctx } = buildHost();
-    await definition().setup(ctx);
-    ctx.secrets.resolve.mockResolvedValue("rotated-discord-bot-token");
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
+    host.ctx.secrets.resolve.mockResolvedValue("rotated-discord-bot-token");
 
-    await definition().onConfigChanged(
+    await host.deliver(
+      COMPANY_A,
       storedConfig({ discordBotTokenRef: { type: "secret_ref", secretId: ROTATED_SECRET_ID } }),
-      { companyId: COMPANY_A },
     );
 
     expect(gatewayCloses.count).toBe(1);
@@ -747,8 +690,9 @@ describe("re-bootstrap on configuration changes", () => {
   });
 
   it("reconnects an unchanged token when the gateway failed permanently (#71)", async () => {
-    const { ctx } = buildHost();
-    await definition().setup(ctx);
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
 
     // Drive the REAL onPermanentFailure the plugin installed, not a hand-set flag:
     // a callback bound to a stale runtime would mark the wrong object.
@@ -757,7 +701,7 @@ describe("re-bootstrap on configuration changes", () => {
     expect(_getRuntimeForTests()?.gatewayFailed).toBe(true);
     expect((await definition().onHealth()).status).toBe("degraded");
 
-    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+    await host.deliver(COMPANY_A, storedConfig());
 
     expect(gatewayConnects).toHaveLength(2);
     expect(liveGateways()).toHaveLength(1);
@@ -790,6 +734,7 @@ describe("re-bootstrap on configuration changes", () => {
   it("serializes a save that rotates the token against the save before it", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
     expect(liveGateways()).toHaveLength(1);
 
     host.deferSecretResolution();
@@ -833,10 +778,12 @@ describe("re-bootstrap on configuration changes", () => {
   });
 
   it("stays bound to the running company when another company's config arrives", async () => {
-    const { ctx } = buildHost();
+    const host = buildHost();
+    const { ctx } = host;
     await definition().setup(ctx);
+    await host.deliver(COMPANY_A, storedConfig());
 
-    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_B });
+    await host.deliver(COMPANY_B, storedConfig({ defaultChannelId: "1490610083728588950" }));
 
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
     expect(gatewayConnects).toHaveLength(1);
