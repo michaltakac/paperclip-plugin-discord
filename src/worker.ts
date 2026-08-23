@@ -44,12 +44,16 @@ import { DiscordAdapter } from "./adapter.js";
 import { processMediaMessage, type MediaAttachment } from "./media-pipeline.js";
 import { registerCommand, parseCommandMessage, executeCommand, listCommands } from "./custom-commands.js";
 import { registerWatch, checkWatches } from "./proactive-suggestions.js";
-import { resolveStartupDiscordBotToken, type DiscordRuntimeHealth } from "./runtime-token.js";
-
-// Module-level state captured during setup() so onWebhook() can reuse it.
-let _pluginCtx: PluginContext | null = null;
-let _cmdCtx: CommandContext | null = null;
-let runtimeHealth: DiscordRuntimeHealth = { status: "ok" };
+import {
+  isUsableSecretRef,
+  normalizeSecretRefId,
+  resolveStartupDiscordBotToken,
+  summarizeError,
+  toSecretRefBinding,
+  SECRET_RESOLUTION_ISSUE_URL,
+  type DiscordRuntimeHealth,
+  type DiscordSecretRef,
+} from "./runtime-token.js";
 
 import { resolveCompanyId } from "./company-resolver.js";
 import {
@@ -62,8 +66,12 @@ import {
 } from "./escalation-state.js";
 
 type DiscordConfig = {
-  discordBotTokenRef: string;
-  paperclipBoardApiKeyRef?: string;
+  /**
+   * Secret reference for the Discord bot token. Accepts both the settings
+   * picker's object binding and a legacy bare secret UUID string.
+   */
+  discordBotTokenRef: DiscordSecretRef;
+  paperclipBoardApiKeyRef?: DiscordSecretRef;
   defaultGuildId: string;
   defaultChannelId: string;
   approvalsChannelId: string;
@@ -138,6 +146,112 @@ interface EscalationCreatedPayload {
 
 const SNOWFLAKE_ID_REGEX = /^\d{17,20}$/;
 
+/** Returned by tools and actions invoked before the runtime is bootstrapped. */
+const RUNTIME_NOT_READY_MESSAGE =
+  "Discord plugin is not configured yet: save the plugin configuration for this company to activate it.";
+
+// ---------------------------------------------------------------------------
+// Runtime state
+// ---------------------------------------------------------------------------
+//
+// setup() runs OUTSIDE any company scope. Since paperclipai/paperclip#9557 the
+// SDK's governed-access gate requires a company scope for `config.get()` and
+// `secrets.resolve()`, so a worker cannot read its own configuration while it
+// starts: an unscoped `ctx.config.get()` in setup() throws and kills activation.
+//
+// setup() therefore only registers handlers. Everything that needs config or a
+// secret lives in this runtime, which is bootstrapped later from whichever of
+// these happens first:
+//   1. `onConfigChanged` — the host delivers stored config with its scope, both
+//      at startup and on every save (the only path that works on 2026.720/722);
+//   2. the first company-scoped invocation (event, job, tool, action);
+//   3. a best-effort startup walk over `companies.list()` at the end of setup()
+//      (works from 2026.817.0, where the host seeds proactive company scopes).
+//
+// Single-tenant by design: one runtime, bound to the first company with a usable
+// bot token. `multiCompanyConfig` stays unset, so the host fails a second
+// company's config closed instead of silently rebinding this worker.
+
+type DiscordRuntime = {
+  companyId: string;
+  config: DiscordConfig;
+  token: string;
+  tokenSecretId: string;
+  paperclipBoardApiKey: string;
+  baseUrl: string;
+  cmdCtx: CommandContext;
+  adapter: DiscordAdapter;
+  gateway: { close: () => void } | null;
+  /** Set when the gateway reports a permanent failure, so re-bootstrap reconnects. */
+  gatewayFailed: boolean;
+  defaultGuildId: string | null;
+  defaultChannelId: string;
+  approvalsChannelId: string | null;
+  errorsChannelId: string | null;
+  bdPipelineChannelId: string | null;
+  escalationChannelId: string | null;
+  intelligenceChannelIds: string[];
+  retentionDays: number;
+  escalationTimeoutMs: number;
+  digestMode: string;
+};
+
+/** Captured in setup() so onWebhook / onConfigChanged can reach the host APIs. */
+let _pluginCtx: PluginContext | null = null;
+let runtime: DiscordRuntime | null = null;
+let runtimeHealth: DiscordRuntimeHealth = {
+  status: "degraded",
+  message: "Waiting for company-scoped configuration from the host",
+  details: {
+    issue: "discord-awaiting-company-config",
+    reference: SECRET_RESOLUTION_ISSUE_URL,
+  },
+};
+
+/** In-flight bootstrap, so concurrent invocations do not race to start the runtime. */
+let bootstrapInFlight: Promise<DiscordRuntime | null> | null = null;
+/** Opportunistic bootstrap attempts are rate-limited; onConfigChanged bypasses this. */
+const BOOTSTRAP_RETRY_COOLDOWN_MS = 60_000;
+let nextOpportunisticBootstrapAt = 0;
+
+/** Event de-duplication window shared by every notification handler. */
+const DEDUP_TTL_MS = 5 * 60 * 1000;
+const seenEvents = new Map<string, number>();
+
+function setRuntimeHealth(health: DiscordRuntimeHealth): void {
+  runtimeHealth = health;
+}
+
+function degradeHealth(message: string, issue: string, details?: Record<string, unknown>): void {
+  runtimeHealth = {
+    status: "degraded",
+    message,
+    details: { issue, reference: SECRET_RESOLUTION_ISSUE_URL, ...details },
+  };
+}
+
+/** Test seam — mirrors `_resetCompanyIdCache()` for the module-level runtime. */
+export function _resetRuntimeForTests(): void {
+  runtime = null;
+  _pluginCtx = null;
+  bootstrapInFlight = null;
+  nextOpportunisticBootstrapAt = 0;
+  seenEvents.clear();
+  runtimeHealth = {
+    status: "degraded",
+    message: "Waiting for company-scoped configuration from the host",
+    details: {
+      issue: "discord-awaiting-company-config",
+      reference: SECRET_RESOLUTION_ISSUE_URL,
+    },
+  };
+}
+
+/** Current runtime, or null when the plugin has not been bootstrapped yet. */
+export function _getRuntimeForTests(): DiscordRuntime | null {
+  return runtime;
+}
+
 function normalizeDiscordId(value: unknown): string | null {
   if (value == null) return null;
   const normalized = String(value).trim();
@@ -172,14 +286,11 @@ async function resolveChannel(
 
   // 3. General `companyChannels` map from plugin config — applies to every event type
   //    that does not have its own specific map.
-  try {
-    const rawConfig = (await ctx.config.get?.()) as DiscordConfig | undefined;
-    const general = rawConfig?.companyChannels;
-    if (general && companyId && general[companyId]) {
-      return normalizeDiscordId(general[companyId]);
-    }
-  } catch {
-    // ctx.config.get may not be available in some SDK versions — fall through silently.
+  //    Read from the bootstrapped runtime: an unscoped `ctx.config.get()` here
+  //    throws on every governed host (paperclipai/paperclip#9557).
+  const general = runtime?.config.companyChannels;
+  if (general && companyId && general[companyId]) {
+    return normalizeDiscordId(general[companyId]);
   }
 
   // 4. Fall back to whatever the caller passed (topicChannel | overrideChannelId | default).
@@ -362,179 +473,409 @@ export async function enrichRunPayload(
   return payload;
 }
 
-const plugin = definePlugin({
-  async setup(ctx) {
-    const rawConfig = await ctx.config.get();
-    ctx.logger.info(`Discord plugin config: ${JSON.stringify(rawConfig)}`);
-    const config = {
-      ...DEFAULT_CONFIG,
-      ...(rawConfig as Record<string, unknown>),
-    } as DiscordConfig;
+// ---------------------------------------------------------------------------
+// Notification helpers
+// ---------------------------------------------------------------------------
+// These used to be closures inside setup() over `config`, `token` and `baseUrl`.
+// Those values now arrive with the runtime, so the helpers take it explicitly.
 
-    // Hard validation: required config must be present. Failing fast with a
-    // clear, plugin-scoped error is far easier to diagnose than silently
-    // disabling the plugin or falling through to an empty channel id. (issue #53)
-    if (!config.discordBotTokenRef || !String(config.discordBotTokenRef).trim()) {
-      throw new Error(
-        `[${PLUGIN_ID}] discordBotTokenRef is required but is missing or empty. ` +
-          `Configure a Discord bot token reference before enabling the plugin.`,
+/**
+ * The runtime may redeliver events (retries, replays). Track recently processed
+ * eventIds so each event produces at most one Discord message.
+ */
+function isDuplicate(eventId: string | undefined): boolean {
+  if (!eventId) return false;
+  const now = Date.now();
+  // Prune stale entries on each check (cheap for small maps)
+  for (const [id, ts] of seenEvents) {
+    if (now - ts > DEDUP_TTL_MS) seenEvents.delete(id);
+  }
+  if (seenEvents.has(eventId)) return true;
+  seenEvents.set(eventId, now);
+  return false;
+}
+
+async function resolveTopicChannel(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  event: PluginEvent,
+): Promise<string | null> {
+  if (!rt.config.topicRouting) return null;
+  const payload = event.payload as Record<string, unknown>;
+  const projectName = payload.projectName ? String(payload.projectName) : null;
+  if (!projectName) return null;
+
+  const channelMap = (await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: "channel-project-map",
+  })) as Record<string, string> | null;
+
+  return normalizeDiscordId(channelMap?.[projectName]) ?? null;
+}
+
+async function notify(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  event: PluginEvent,
+  formatter: (e: PluginEvent, baseUrl?: string) => ReturnType<typeof formatIssueCreated>,
+  overrideChannelId?: string,
+  channelMap?: Record<string, string>,
+  onPosted?: (channelId: string, messageId: string) => Promise<void>,
+): Promise<void> {
+  if (isDuplicate(event.eventId)) {
+    ctx.logger.debug(`Skipping duplicate event ${event.eventType} (${event.eventId})`);
+    return;
+  }
+
+  const topicChannel = overrideChannelId ? null : await resolveTopicChannel(ctx, rt, event);
+  const channelId = await resolveChannel(
+    ctx,
+    event.companyId,
+    topicChannel || overrideChannelId || rt.defaultChannelId,
+    channelMap,
+  );
+  if (!channelId) return;
+
+  const message = formatter(event, rt.baseUrl);
+  const messageId = await postEmbedWithId(ctx, rt.token, channelId, message);
+
+  if (messageId) {
+    // Store message mapping for reply routing
+    if (rt.config.enableInbound !== false) {
+      await ctx.state.set(
+        { scopeKind: "instance", stateKey: `msg_${channelId}_${messageId}` },
+        {
+          entityId: event.entityId,
+          entityType: event.entityType,
+          companyId: event.companyId,
+          eventType: event.eventType,
+        },
       );
     }
-    if (!config.defaultChannelId || !String(config.defaultChannelId).trim()) {
-      throw new Error(
-        `[${PLUGIN_ID}] defaultChannelId is required but is missing or empty. ` +
-          `Set the default Discord channel ID before enabling the plugin.`,
-      );
-    }
 
-    const token = await resolveStartupDiscordBotToken(ctx, config.discordBotTokenRef, (health) => {
-      runtimeHealth = health;
+    await ctx.activity.log({
+      companyId: event.companyId,
+      message: `Forwarded ${event.eventType} to Discord`,
+      entityType: "plugin",
+      entityId: event.entityId,
     });
-    if (!token) {
-      ctx.logger.warn("Discord plugin runtime disabled because bot token could not be resolved");
-      return;
-    }
-    let paperclipBoardApiKey = "";
-    if (config.paperclipBoardApiKeyRef) {
-      try {
-        paperclipBoardApiKey = await ctx.secrets.resolve(config.paperclipBoardApiKeyRef);
-      } catch (err) {
-        ctx.logger.warn("Discord plugin could not resolve Paperclip board API key; board features are disabled", {
-          error: String(err),
-        });
-      }
-    }
-    const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
-    const retentionDays = config.intelligenceRetentionDays || 30;
-    const defaultGuildId = normalizeDiscordId(config.defaultGuildId);
-    const defaultChannelId = normalizeDiscordId(config.defaultChannelId) ?? "";
-    const approvalsChannelId = normalizeDiscordId(config.approvalsChannelId);
-    const errorsChannelId = normalizeDiscordId(config.errorsChannelId);
-    const bdPipelineChannelId = normalizeDiscordId(config.bdPipelineChannelId);
-    const escalationChannelId = normalizeDiscordId(config.escalationChannelId) ?? defaultChannelId;
-    const intelligenceChannelIds = normalizeDiscordIdList(config.intelligenceChannelIds);
 
-    // Company ID is resolved lazily on first /clip command or job invocation,
-    // NOT during setup — startup-time API calls can cause worker activation to fail.
-    const companyId = "default"; // placeholder; jobs use resolveCompanyId(ctx) at runtime
+    if (onPosted) {
+      await onPosted(channelId, messageId);
+    }
+  }
+}
 
-    const cmdCtx: CommandContext = {
+function buildEscalationEmbed(payload: EscalationCreatedPayload): {
+  embeds: DiscordEmbed[];
+  components: DiscordComponent[];
+} {
+  const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
+  fields.push({ name: "Reason", value: payload.reason.slice(0, 1024) });
+
+  if (payload.confidenceScore !== undefined) {
+    fields.push({
+      name: "Confidence Score",
+      value: `${(payload.confidenceScore * 100).toFixed(0)}%`,
+      inline: true,
+    });
+  }
+
+  if (payload.agentReasoning) {
+    fields.push({ name: "Agent Reasoning", value: payload.agentReasoning.slice(0, 1024) });
+  }
+
+  if (payload.suggestedReply) {
+    fields.push({ name: "Suggested Reply", value: payload.suggestedReply.slice(0, 1024) });
+  }
+
+  let description: string | undefined;
+  if (payload.conversationHistory && payload.conversationHistory.length > 0) {
+    const recent = payload.conversationHistory.slice(-5);
+    const lines = recent.map((msg) => {
+      const role = msg.role === "user" ? "Customer" : msg.role === "assistant" ? "Agent" : msg.role;
+      return `**${role}:** ${msg.content.slice(0, 200)}`;
+    });
+    description = lines.join("\n\n").slice(0, 2048);
+  }
+
+  const embeds: DiscordEmbed[] = [
+    {
+      title: `Escalation from ${payload.agentName}`,
+      description,
+      color: COLORS.YELLOW,
+      fields,
+      footer: { text: "Paperclip Escalation" },
+      timestamp: new Date().toISOString(),
+    },
+  ];
+
+  const buttons: DiscordComponent[] = [];
+  const cid = payload.companyId || "default";
+
+  if (payload.suggestedReply) {
+    buttons.push({
+      type: 2,
+      style: 3,
+      label: "Use Suggested Reply",
+      custom_id: `esc_suggest_${cid}_${payload.escalationId}`,
+    });
+  }
+
+  buttons.push(
+    { type: 2, style: 1, label: "Reply to Customer", custom_id: `esc_reply_${cid}_${payload.escalationId}` },
+    { type: 2, style: 2, label: "Override Agent", custom_id: `esc_override_${cid}_${payload.escalationId}` },
+    { type: 2, style: 4, label: "Dismiss", custom_id: `esc_dismiss_${cid}_${payload.escalationId}` },
+  );
+
+  const components: DiscordComponent[] = [{ type: 1, components: buttons }];
+  return { embeds, components };
+}
+
+/** Reply routing for inbound Discord messages. */
+async function handleMessageCreate(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  message: MessageCreateEvent,
+): Promise<void> {
+  if (rt.config.enableInbound === false) return;
+  // Ignore bot messages
+  if (message.author.bot) return;
+  // Only handle replies to other messages
+  if (!message.message_reference?.message_id) return;
+
+  const refChannelId = message.message_reference.channel_id ?? message.channel_id;
+  const refMessageId = message.message_reference.message_id;
+
+  const mapping = await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: `msg_${refChannelId}_${refMessageId}`,
+  }) as { entityId: string; entityType: string; companyId: string } | null;
+
+  if (!mapping) return;
+
+  const text = message.content;
+  if (!text?.trim()) return;
+
+  if (mapping.entityType === "escalation") {
+    // Route to escalation response
+    const escalationCompanyId = mapping.companyId || "default";
+    let record = await ctx.state.get({
+      scopeKind: "company",
+      scopeId: escalationCompanyId,
+      stateKey: `escalation_${mapping.entityId}`,
+    }) as EscalationRecord | null;
+    // Backward-compat fallback: check "default" scope if company-scoped read returns null
+    if (!record && escalationCompanyId !== "default") {
+      record = await ctx.state.get({
+        scopeKind: "company",
+        scopeId: "default",
+        stateKey: `escalation_${mapping.entityId}`,
+      }) as EscalationRecord | null;
+    }
+
+    if (record && record.status === "pending") {
+      record.status = "resolved";
+      record.resolvedAt = new Date().toISOString();
+      record.resolvedBy = `discord:${message.author.username}`;
+      record.resolution = "human_reply";
+      await ctx.state.set(
+        { scopeKind: "company", scopeId: escalationCompanyId, stateKey: `escalation_${mapping.entityId}` },
+        record,
+      );
+      await ctx.metrics.write(METRIC_NAMES.escalationsResolved, 1);
+      ctx.events.emit("escalation-resolved", mapping.companyId, {
+        escalationId: mapping.entityId,
+        action: "human_reply",
+        resolvedBy: message.author.username,
+        responseText: text,
+      });
+    }
+
+    await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+    ctx.logger.info("Routed Discord reply to escalation", {
+      escalationId: mapping.entityId,
+      from: message.author.username,
+    });
+  } else if (mapping.entityType === "issue") {
+    // Route to issue comment
+    try {
+      await paperclipFetch(
+        `${rt.baseUrl}/api/issues/${mapping.entityId}/comments`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            body: text,
+            authorUserId: `discord:${message.author.username}`,
+          }),
+        },
+        rt.paperclipBoardApiKey,
+      );
+      await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+      ctx.logger.info("Routed Discord reply to issue comment", {
+        issueId: mapping.entityId,
+        from: message.author.username,
+      });
+    } catch (err) {
+      ctx.logger.error("Failed to route inbound message", { error: String(err) });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime bootstrap
+// ---------------------------------------------------------------------------
+
+/**
+ * Start (or refresh) the runtime for one company from its stored config.
+ *
+ * Idempotent by contract:
+ * - same company, same bot token, live gateway → refresh config in place and keep
+ *   the Discord connection (no reconnect storm on every settings save);
+ * - same company, rotated token or a gateway that failed permanently → tear the
+ *   connection down and reconnect;
+ * - a different company while one is already running → log and keep the running
+ *   one (single-tenant; see "Runtime state").
+ *
+ * Never throws: every failure path degrades health and returns null.
+ */
+async function bootstrapRuntime(
+  ctx: PluginContext,
+  companyId: string,
+  rawConfig: unknown,
+): Promise<DiscordRuntime | null> {
+  const existing = runtime;
+  if (existing && existing.companyId !== companyId) {
+    ctx.logger.warn(
+      "Discord plugin is already bound to a company; ignoring configuration for another company",
+      { runningCompanyId: existing.companyId, deliveredCompanyId: companyId },
+    );
+    return existing;
+  }
+
+  const config = {
+    ...DEFAULT_CONFIG,
+    ...(rawConfig as Record<string, unknown>),
+  } as DiscordConfig;
+
+  // Required config is reported through health, never thrown: throwing here would
+  // kill worker activation on a host that simply has not delivered config yet.
+  // `onValidateConfig` is what fails a bad save loudly in the settings UI.
+  if (!isUsableSecretRef(config.discordBotTokenRef)) {
+    degradeHealth(
+      `[${PLUGIN_ID}] discordBotTokenRef is missing or empty; select the Discord bot token secret in plugin settings`,
+      "discord-bot-token-missing",
+      { companyId },
+    );
+    ctx.logger.warn("Discord plugin config has no bot token reference", { companyId });
+    return null;
+  }
+
+  const defaultChannelId = normalizeDiscordId(config.defaultChannelId) ?? "";
+  if (!defaultChannelId) {
+    degradeHealth(
+      `[${PLUGIN_ID}] defaultChannelId is missing or empty; set the default Discord channel ID in plugin settings`,
+      "discord-default-channel-missing",
+      { companyId },
+    );
+    ctx.logger.warn("Discord plugin config has no default channel", { companyId });
+    return null;
+  }
+
+  const token = await resolveStartupDiscordBotToken(
+    ctx,
+    config.discordBotTokenRef,
+    setRuntimeHealth,
+    { companyId, configPath: "discordBotTokenRef" },
+  );
+  if (!token) {
+    ctx.logger.warn("Discord plugin runtime disabled because bot token could not be resolved", {
+      companyId,
+    });
+    return null;
+  }
+
+  let paperclipBoardApiKey = "";
+  if (isUsableSecretRef(config.paperclipBoardApiKeyRef)) {
+    try {
+      paperclipBoardApiKey = await ctx.secrets.resolve(
+        toSecretRefBinding(config.paperclipBoardApiKeyRef)!,
+        { companyId, configPath: "paperclipBoardApiKeyRef" },
+      );
+    } catch (err) {
+      ctx.logger.warn("Discord plugin could not resolve Paperclip board API key; board features are disabled", {
+        error: summarizeError(err),
+        companyId,
+      });
+    }
+  }
+
+  const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
+  const defaultGuildId = normalizeDiscordId(config.defaultGuildId);
+  const rt: DiscordRuntime = {
+    companyId,
+    config,
+    token,
+    tokenSecretId: normalizeSecretRefId(config.discordBotTokenRef) ?? "",
+    paperclipBoardApiKey,
+    baseUrl,
+    cmdCtx: {
       baseUrl,
       companyId,
       token,
       paperclipBoardApiKey,
       defaultChannelId,
       pluginCtx: ctx,
-    };
+    },
+    adapter: new DiscordAdapter(ctx, token),
+    gateway: null,
+    gatewayFailed: false,
+    defaultGuildId,
+    defaultChannelId,
+    approvalsChannelId: normalizeDiscordId(config.approvalsChannelId),
+    errorsChannelId: normalizeDiscordId(config.errorsChannelId),
+    bdPipelineChannelId: normalizeDiscordId(config.bdPipelineChannelId),
+    escalationChannelId: normalizeDiscordId(config.escalationChannelId) ?? defaultChannelId,
+    intelligenceChannelIds: normalizeDiscordIdList(config.intelligenceChannelIds),
+    retentionDays: config.intelligenceRetentionDays || 30,
+    escalationTimeoutMs: (config.escalationTimeoutMinutes || 30) * 60 * 1000,
+    digestMode: config.digestMode ?? "off",
+  };
 
-    // Store context at module level so onWebhook() can reuse it.
-    _pluginCtx = ctx;
-    _cmdCtx = cmdCtx;
+  // Keep a healthy connection across a settings save; reconnect when the token
+  // changed or the gateway stopped for good (#71 reports that through health).
+  const reusableGateway =
+    existing && existing.gateway && !existing.gatewayFailed && existing.token === token
+      ? existing.gateway
+      : null;
+  if (existing?.gateway && !reusableGateway) {
+    try {
+      existing.gateway.close();
+    } catch (err) {
+      ctx.logger.debug("Closing the previous Discord gateway failed", { error: summarizeError(err) });
+    }
+  }
 
-    // --- Register slash commands with Discord ---
-    if (defaultGuildId) {
+  // Publish the runtime before the network work: gateway callbacks read it.
+  rt.gateway = reusableGateway;
+  runtime = rt;
+
+  if (defaultGuildId) {
+    try {
       const appId = await getApplicationId(ctx, token);
       if (appId) {
-        const registered = await registerSlashCommands(
-          ctx,
-          token,
-          appId,
-          defaultGuildId,
-          SLASH_COMMANDS,
-        );
+        const registered = await registerSlashCommands(ctx, token, appId, defaultGuildId, SLASH_COMMANDS);
         if (registered) {
           ctx.logger.info("Slash commands registered with Discord");
         }
       }
+    } catch (err) {
+      ctx.logger.warn("Discord slash command registration failed", { error: summarizeError(err) });
     }
+  }
 
-    // --- Reply routing handler for inbound messages ---
-    async function handleMessageCreate(message: MessageCreateEvent): Promise<void> {
-      if (config.enableInbound === false) return;
-      // Ignore bot messages
-      if (message.author.bot) return;
-      // Only handle replies to other messages
-      if (!message.message_reference?.message_id) return;
-
-      const refChannelId = message.message_reference.channel_id ?? message.channel_id;
-      const refMessageId = message.message_reference.message_id;
-
-      const mapping = await ctx.state.get({
-        scopeKind: "instance",
-        stateKey: `msg_${refChannelId}_${refMessageId}`,
-      }) as { entityId: string; entityType: string; companyId: string } | null;
-
-      if (!mapping) return;
-
-      const text = message.content;
-      if (!text?.trim()) return;
-
-      if (mapping.entityType === "escalation") {
-        // Route to escalation response
-        const escalationCompanyId = mapping.companyId || "default";
-        let record = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: escalationCompanyId,
-          stateKey: `escalation_${mapping.entityId}`,
-        }) as EscalationRecord | null;
-        // Backward-compat fallback: check "default" scope if company-scoped read returns null
-        if (!record && escalationCompanyId !== "default") {
-          record = await ctx.state.get({
-            scopeKind: "company",
-            scopeId: "default",
-            stateKey: `escalation_${mapping.entityId}`,
-          }) as EscalationRecord | null;
-        }
-
-        if (record && record.status === "pending") {
-          record.status = "resolved";
-          record.resolvedAt = new Date().toISOString();
-          record.resolvedBy = `discord:${message.author.username}`;
-          record.resolution = "human_reply";
-          await ctx.state.set(
-            { scopeKind: "company", scopeId: escalationCompanyId, stateKey: `escalation_${mapping.entityId}` },
-            record,
-          );
-          await ctx.metrics.write(METRIC_NAMES.escalationsResolved, 1);
-          ctx.events.emit("escalation-resolved", mapping.companyId, {
-            escalationId: mapping.entityId,
-            action: "human_reply",
-            resolvedBy: message.author.username,
-            responseText: text,
-          });
-        }
-
-        await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-        ctx.logger.info("Routed Discord reply to escalation", {
-          escalationId: mapping.entityId,
-          from: message.author.username,
-        });
-      } else if (mapping.entityType === "issue") {
-        // Route to issue comment
-        try {
-          await paperclipFetch(
-            `${baseUrl}/api/issues/${mapping.entityId}/comments`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                body: text,
-                authorUserId: `discord:${message.author.username}`,
-              }),
-            },
-            paperclipBoardApiKey,
-          );
-          await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-          ctx.logger.info("Routed Discord reply to issue comment", {
-            issueId: mapping.entityId,
-            from: message.author.username,
-          });
-        } catch (err) {
-          ctx.logger.error("Failed to route inbound message", { error: String(err) });
-        }
-      }
-    }
-
+  if (!reusableGateway) {
     const gatewayNeedsMessages =
       config.enableInbound !== false ||
       config.enableMediaPipeline === true ||
@@ -542,32 +883,177 @@ const plugin = definePlugin({
       config.enableProactiveSuggestions === true ||
       config.enableIntelligence === true;
 
-    // --- Gateway connection for real-time interaction handling ---
-    const gateway = await connectGateway(
-      ctx,
-      token,
-      async (interaction) => {
-        return handleInteraction(ctx, interaction as any, cmdCtx);
-      },
-      gatewayNeedsMessages ? handleMessageCreate : undefined,
-      {
-        listenForMessages: gatewayNeedsMessages,
-        includeMessageContent: gatewayNeedsMessages,
-        // Fatal close codes and identify-budget exhaustion stop the gateway
-        // permanently; report it through plugin health instead of running
-        // silently without realtime Discord connectivity.
-        onPermanentFailure: (message, details) => {
-          runtimeHealth = { status: "degraded", message, details };
+    try {
+      rt.gateway = await connectGateway(
+        ctx,
+        token,
+        async (interaction) => handleInteraction(ctx, interaction as any, rt.cmdCtx),
+        gatewayNeedsMessages ? (message) => handleMessageCreate(ctx, rt, message) : undefined,
+        {
+          listenForMessages: gatewayNeedsMessages,
+          includeMessageContent: gatewayNeedsMessages,
+          // Fatal close codes and identify-budget exhaustion stop the gateway
+          // permanently; report it through plugin health instead of running
+          // silently without realtime Discord connectivity.
+          onPermanentFailure: (message, details) => {
+            rt.gatewayFailed = true;
+            runtimeHealth = { status: "degraded", message, details };
+          },
         },
-      },
+      );
+    } catch (err) {
+      const error = summarizeError(err);
+      rt.gatewayFailed = true;
+      degradeHealth(`Discord gateway connection failed: ${error}`, "discord-gateway-unavailable", {
+        companyId,
+      });
+      ctx.logger.error("Discord gateway connection failed", { error, companyId });
+      // Notifications, jobs and tools still work over REST — keep the runtime.
+      return rt;
+    }
+  }
+
+  if (runtimeHealth.status !== "ok") {
+    setRuntimeHealth({ status: "ok" });
+  }
+  ctx.logger.info("Discord plugin runtime started", {
+    companyId,
+    gateway: rt.gateway ? "connected" : "unavailable",
+    reusedConnection: reusableGateway !== null,
+  });
+
+  startBackfillIfEnabled(ctx, rt);
+  return rt;
+}
+
+/** First-install historical intelligence backfill, fire-and-forget. */
+function startBackfillIfEnabled(ctx: PluginContext, rt: DiscordRuntime): void {
+  if (!rt.config.enableIntelligence || rt.intelligenceChannelIds.length === 0 || !rt.defaultGuildId) {
+    return;
+  }
+  void (async () => {
+    const cid = await resolveCompanyId(ctx);
+    const existing = await ctx.state.get({
+      scopeKind: "company",
+      scopeId: cid,
+      stateKey: "discord_intelligence",
+    }) as { backfillComplete?: boolean } | null;
+
+    if (!existing?.backfillComplete) {
+      ctx.logger.info("First install detected, starting historical backfill");
+      await runBackfill(
+        ctx,
+        rt.token,
+        rt.defaultGuildId!,
+        rt.intelligenceChannelIds,
+        cid,
+        rt.config.backfillDays ?? 90,
+      );
+    }
+  })().catch((err) => ctx.logger.warn("Backfill failed", { error: summarizeError(err) }));
+}
+
+/** Read one company's stored config with an explicit scope, then bootstrap from it. */
+async function bootstrapFromScopedConfig(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<DiscordRuntime | null> {
+  let rawConfig: unknown;
+  try {
+    rawConfig = await ctx.config.get(companyId);
+  } catch (err) {
+    const error = summarizeError(err);
+    ctx.logger.info("Company-scoped plugin config is not readable yet; waiting for the host to deliver it", {
+      companyId,
+      error,
+    });
+    degradeHealth(
+      `Company-scoped configuration is not readable yet (${error}). Save the plugin configuration once to activate the runtime.`,
+      "discord-scoped-config-denied",
+      { companyId },
     );
+    return null;
+  }
+  if (!rawConfig || Object.keys(rawConfig as Record<string, unknown>).length === 0) return null;
+  return bootstrapRuntime(ctx, companyId, rawConfig);
+}
+
+/**
+ * Best-effort startup walk: list companies, try each company's stored config,
+ * first one with a usable bot token wins. Works from 2026.817.0, where the host
+ * seeds proactive company scopes for companies that already have a config row.
+ */
+async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRuntime | null> {
+  let companies: Array<{ id: string }> = [];
+  try {
+    companies = await ctx.companies.list();
+  } catch (err) {
+    ctx.logger.info("Could not list companies during startup; waiting for a config delivery", {
+      error: summarizeError(err),
+    });
+    return null;
+  }
+
+  for (const company of companies) {
+    const started = await bootstrapFromScopedConfig(ctx, company.id);
+    if (started) return started;
+  }
+  return null;
+}
+
+/**
+ * Return the running runtime, bootstrapping it opportunistically when a
+ * company-scoped invocation gives us a scope to read config with.
+ */
+async function ensureRuntime(
+  ctx: PluginContext | null,
+  companyId?: string | null,
+): Promise<DiscordRuntime | null> {
+  if (runtime) return runtime;
+  const pluginCtx = ctx ?? _pluginCtx;
+  if (!pluginCtx) return null;
+  if (bootstrapInFlight) return bootstrapInFlight;
+  if (Date.now() < nextOpportunisticBootstrapAt) return null;
+  nextOpportunisticBootstrapAt = Date.now() + BOOTSTRAP_RETRY_COOLDOWN_MS;
+
+  bootstrapInFlight = (async () => {
+    try {
+      if (companyId) {
+        const started = await bootstrapFromScopedConfig(pluginCtx, companyId);
+        if (started) return started;
+      }
+      return await bootstrapFromStartupWalk(pluginCtx);
+    } catch (err) {
+      pluginCtx.logger.warn("Discord plugin bootstrap attempt failed", { error: summarizeError(err) });
+      return null;
+    } finally {
+      bootstrapInFlight = null;
+    }
+  })();
+
+  return bootstrapInFlight;
+}
+
+const plugin = definePlugin({
+  async setup(ctx) {
+    _pluginCtx = ctx;
+
+    // Handlers are registered unconditionally.
+    //
+    // The feature flags that used to gate these registrations live in company-
+    // scoped config, which is unreadable here (see "Runtime state"), and the SDK
+    // requires every registration to complete synchronously within setup().
+    // Each handler therefore starts by resolving the runtime and checking its own
+    // flag against the live config, and no-ops until the runtime exists.
 
     ctx.events.on("plugin.stopping", async () => {
-      gateway.close();
+      runtime?.gateway?.close();
     });
 
     // --- ACP bridge: listen for cross-plugin ACP output events ---
     ctx.events.on(`${ACP_PLUGIN_EVENT_PREFIX}.output`, async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt) return;
       const payload = event.payload as {
         sessionId: string;
         threadId: string;
@@ -575,207 +1061,136 @@ const plugin = definePlugin({
         output: string;
         status?: "running" | "completed" | "failed";
       };
-      await handleAcpOutput(ctx, token, payload);
+      await handleAcpOutput(ctx, rt.token, payload);
     });
-
-    // --- Event deduplication ---
-    // The runtime may redeliver events (retries, replays). Track recently
-    // processed eventIds so each event produces at most one Discord message.
-    const DEDUP_TTL_MS = 5 * 60 * 1000; // 5 minutes
-    const seenEvents = new Map<string, number>(); // eventId → timestamp
-
-    function isDuplicate(eventId: string | undefined): boolean {
-      if (!eventId) return false;
-      const now = Date.now();
-      // Prune stale entries on each check (cheap for small maps)
-      for (const [id, ts] of seenEvents) {
-        if (now - ts > DEDUP_TTL_MS) seenEvents.delete(id);
-      }
-      if (seenEvents.has(eventId)) return true;
-      seenEvents.set(eventId, now);
-      return false;
-    }
 
     // --- Event subscriptions ---
 
-    const resolveTopicChannel = async (event: PluginEvent): Promise<string | null> => {
-      if (!config.topicRouting) return null;
-      const payload = event.payload as Record<string, unknown>;
-      const projectName = payload.projectName ? String(payload.projectName) : null;
-      if (!projectName) return null;
+    ctx.events.on("issue.created", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt || !rt.config.notifyOnIssueCreated) return;
+      const payload = await enrichIssueNotificationPayload(ctx, event);
+      await notify(ctx, rt, { ...event, payload }, formatIssueCreated);
+    });
 
-      const channelMap = (await ctx.state.get({
-        scopeKind: "instance",
-        stateKey: "channel-project-map",
-      })) as Record<string, string> | null;
+    ctx.events.on("issue.updated", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt || !rt.config.notifyOnIssueDone) return;
+      const payload = await enrichIssueNotificationPayload(ctx, event);
+      if (payload.status !== "done") return;
 
-      return normalizeDiscordId(channelMap?.[projectName]) ?? null;
-    };
-
-    const notify = async (
-      event: PluginEvent,
-      formatter: (e: PluginEvent, baseUrl?: string) => ReturnType<typeof formatIssueCreated>,
-      overrideChannelId?: string,
-      channelMap?: Record<string, string>,
-      onPosted?: (channelId: string, messageId: string) => Promise<void>,
-    ): Promise<void> => {
-      if (isDuplicate(event.eventId)) {
-        ctx.logger.debug(`Skipping duplicate event ${event.eventType} (${event.eventId})`);
-        return;
-      }
-
-      const topicChannel = overrideChannelId ? null : await resolveTopicChannel(event);
-      const channelId = await resolveChannel(ctx, event.companyId, topicChannel || overrideChannelId || config.defaultChannelId, channelMap);
-      if (!channelId) return;
-
-      const message = formatter(event, baseUrl);
-      const messageId = await postEmbedWithId(ctx, token, channelId, message);
-
-      if (messageId) {
-        // Store message mapping for reply routing
-        if (config.enableInbound !== false) {
-          await ctx.state.set(
-            { scopeKind: "instance", stateKey: `msg_${channelId}_${messageId}` },
-            {
-              entityId: event.entityId,
-              entityType: event.entityType,
-              companyId: event.companyId,
-              eventType: event.eventType,
-            },
-          );
+      const completionMarker = String(payload.completedAt ?? "");
+      if (completionMarker) {
+        const stateKey = `issue_done_notified_${event.entityId}`;
+        const previousMarker = await ctx.state.get({
+          scopeKind: "instance",
+          stateKey,
+        }) as string | null;
+        if (previousMarker === completionMarker) {
+          ctx.logger.debug(`Skipping duplicate completion notification for ${event.entityId}`);
+          return;
         }
-
-        await ctx.activity.log({
-          companyId: event.companyId,
-          message: `Forwarded ${event.eventType} to Discord`,
-          entityType: "plugin",
-          entityId: event.entityId,
-        });
-
-        if (onPosted) {
-          await onPosted(channelId, messageId);
-        }
-      }
-    };
-
-    if (config.notifyOnIssueCreated) {
-      ctx.events.on("issue.created", async (event: PluginEvent) => {
-        const payload = await enrichIssueNotificationPayload(ctx, event);
-        await notify({ ...event, payload }, formatIssueCreated);
-      });
-    }
-
-    if (config.notifyOnIssueDone) {
-      ctx.events.on("issue.updated", async (event: PluginEvent) => {
-        const payload = await enrichIssueNotificationPayload(ctx, event);
-        if (payload.status !== "done") return;
-
-        const completionMarker = String(payload.completedAt ?? "");
-        if (completionMarker) {
-          const stateKey = `issue_done_notified_${event.entityId}`;
-          const previousMarker = await ctx.state.get({
-            scopeKind: "instance",
-            stateKey,
-          }) as string | null;
-          if (previousMarker === completionMarker) {
-            ctx.logger.debug(`Skipping duplicate completion notification for ${event.entityId}`);
-            return;
-          }
-          await ctx.state.set(
-            { scopeKind: "instance", stateKey },
-            completionMarker,
-          );
-        }
-
-        await notify({ ...event, payload }, formatIssueDone);
-      });
-    }
-
-    if (config.notifyOnApprovalCreated) {
-      ctx.events.on("approval.created", async (event: PluginEvent) => {
-        await notify(
-          event,
-          formatApprovalCreated,
-          approvalsChannelId ?? undefined,
-          config.approvalsChannels,
-          async (channelId, messageId) => {
-            // Store reverse mapping so decision events can update the original message
-            await ctx.state.set(
-              { scopeKind: "instance", stateKey: `approval_${event.entityId}` },
-              { channelId, messageId },
-            );
-          },
+        await ctx.state.set(
+          { scopeKind: "instance", stateKey },
+          completionMarker,
         );
-      });
+      }
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ctx.events.on("approval.approved" as any, async (event: PluginEvent) => {
-        const record = await ctx.state.get({
-          scopeKind: "instance",
-          stateKey: `approval_${event.entityId}`,
-        }) as { channelId: string; messageId: string } | null;
-        if (!record) return;
+      await notify(ctx, rt, { ...event, payload }, formatIssueDone);
+    });
 
-        const decidedBy = event.actorId ?? "";
-        const label = decidedBy ? `✅ Approved by ${decidedBy}` : "✅ Approved";
-        await adapter.editMessage(record.channelId, record.messageId, {
-          embeds: [
-            {
-              title: label,
-              color: COLORS.GREEN,
-              footer: { text: "Paperclip" },
-              timestamp: event.occurredAt,
-            },
-          ],
-          components: [],
-        });
-      });
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ctx.events.on("approval.rejected" as any, async (event: PluginEvent) => {
-        const record = await ctx.state.get({
-          scopeKind: "instance",
-          stateKey: `approval_${event.entityId}`,
-        }) as { channelId: string; messageId: string } | null;
-        if (!record) return;
-
-        const decidedBy = event.actorId ?? "";
-        const label = decidedBy ? `❌ Rejected by ${decidedBy}` : "❌ Rejected";
-        await adapter.editMessage(record.channelId, record.messageId, {
-          embeds: [
-            {
-              title: label,
-              color: COLORS.RED,
-              footer: { text: "Paperclip" },
-              timestamp: event.occurredAt,
-            },
-          ],
-          components: [],
-        });
-      });
-    }
-
-    if (config.notifyOnAgentError) {
-      ctx.events.on("agent.run.failed", (event: PluginEvent) =>
-        notify(event, formatSessionFailure, errorsChannelId ?? undefined),
+    ctx.events.on("approval.created", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt || !rt.config.notifyOnApprovalCreated) return;
+      await notify(
+        ctx,
+        rt,
+        event,
+        formatApprovalCreated,
+        rt.approvalsChannelId ?? undefined,
+        rt.config.approvalsChannels,
+        async (channelId, messageId) => {
+          // Store reverse mapping so decision events can update the original message
+          await ctx.state.set(
+            { scopeKind: "instance", stateKey: `approval_${event.entityId}` },
+            { channelId, messageId },
+          );
+        },
       );
-    }
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ctx.events.on("approval.approved" as any, async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt || !rt.config.notifyOnApprovalCreated) return;
+      const record = await ctx.state.get({
+        scopeKind: "instance",
+        stateKey: `approval_${event.entityId}`,
+      }) as { channelId: string; messageId: string } | null;
+      if (!record) return;
+
+      const decidedBy = event.actorId ?? "";
+      const label = decidedBy ? `✅ Approved by ${decidedBy}` : "✅ Approved";
+      await rt.adapter.editMessage(record.channelId, record.messageId, {
+        embeds: [
+          {
+            title: label,
+            color: COLORS.GREEN,
+            footer: { text: "Paperclip" },
+            timestamp: event.occurredAt,
+          },
+        ],
+        components: [],
+      });
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ctx.events.on("approval.rejected" as any, async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt || !rt.config.notifyOnApprovalCreated) return;
+      const record = await ctx.state.get({
+        scopeKind: "instance",
+        stateKey: `approval_${event.entityId}`,
+      }) as { channelId: string; messageId: string } | null;
+      if (!record) return;
+
+      const decidedBy = event.actorId ?? "";
+      const label = decidedBy ? `❌ Rejected by ${decidedBy}` : "❌ Rejected";
+      await rt.adapter.editMessage(record.channelId, record.messageId, {
+        embeds: [
+          {
+            title: label,
+            color: COLORS.RED,
+            footer: { text: "Paperclip" },
+            timestamp: event.occurredAt,
+          },
+        ],
+        components: [],
+      });
+    });
+
+    ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt || !rt.config.notifyOnAgentError) return;
+      await notify(ctx, rt, event, formatSessionFailure, rt.errorsChannelId ?? undefined);
+    });
 
     ctx.events.on("agent.run.started", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt) return;
       const payload = await enrichRunPayload(ctx, event);
-      await notify({ ...event, payload }, formatAgentRunStarted, bdPipelineChannelId ?? undefined);
+      await notify(ctx, rt, { ...event, payload }, formatAgentRunStarted, rt.bdPipelineChannelId ?? undefined);
     });
     ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt) return;
       const payload = await enrichRunPayload(ctx, event);
-      await notify({ ...event, payload }, formatAgentRunFinished, bdPipelineChannelId ?? undefined);
+      await notify(ctx, rt, { ...event, payload }, formatAgentRunFinished, rt.bdPipelineChannelId ?? undefined);
     });
 
     // ===================================================================
     // Phase 1: Escalation - human-in-the-loop support
     // ===================================================================
-
-    const adapter = new DiscordAdapter(ctx, token);
-    const escalationTimeoutMs = (config.escalationTimeoutMinutes || 30) * 60 * 1000;
 
     // Escalation state helpers are imported from ./escalation-state.js
     // Local wrappers that close over ctx for call-site convenience:
@@ -784,119 +1199,53 @@ const plugin = definePlugin({
     const _trackPending = (id: string, cid?: string) => trackPendingEscalation(ctx, id, cid);
     const _untrackPending = (id: string, cid?: string) => untrackPendingEscalation(ctx, id, cid);
 
-    function buildEscalationEmbed(payload: EscalationCreatedPayload): {
-      embeds: DiscordEmbed[];
-      components: DiscordComponent[];
-    } {
-      const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
-      fields.push({ name: "Reason", value: payload.reason.slice(0, 1024) });
+    ctx.events.on(`plugin.${PLUGIN_ID}.escalation-created`, async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt || rt.config.enableEscalations === false) return;
+      if (isDuplicate(event.eventId)) {
+        ctx.logger.debug(`Skipping duplicate escalation event (${event.eventId})`);
+        return;
+      }
 
-      if (payload.confidenceScore !== undefined) {
-        fields.push({
-          name: "Confidence Score",
-          value: `${(payload.confidenceScore * 100).toFixed(0)}%`,
-          inline: true,
+      const payload = event.payload as unknown as EscalationCreatedPayload;
+      const escalationId = payload.escalationId || event.entityId || "";
+      payload.escalationId = escalationId;
+
+      const channelId = await resolveChannel(ctx, event.companyId, rt.escalationChannelId);
+      if (!channelId) return;
+
+      const { embeds, components } = buildEscalationEmbed(payload);
+      const messageId = await rt.adapter.sendButtons(channelId, embeds, components);
+
+      if (messageId) {
+        const record: EscalationRecord = {
+          escalationId,
+          companyId: event.companyId,
+          agentName: payload.agentName,
+          reason: payload.reason,
+          confidenceScore: payload.confidenceScore,
+          agentReasoning: payload.agentReasoning,
+          conversationHistory: payload.conversationHistory,
+          suggestedReply: payload.suggestedReply,
+          channelId,
+          messageId,
+          status: "pending",
+          createdAt: new Date().toISOString(),
+        };
+        await _saveEscalation(record);
+        await _trackPending(escalationId, event.companyId);
+        await ctx.metrics.write(METRIC_NAMES.escalationsCreated, 1);
+
+        await ctx.activity.log({
+          companyId: event.companyId,
+          message: `Escalation created by ${payload.agentName}: ${payload.reason.slice(0, 100)}`,
+          entityType: "escalation",
+          entityId: escalationId,
         });
+
+        ctx.logger.info("Escalation posted to Discord", { escalationId, channelId, messageId });
       }
-
-      if (payload.agentReasoning) {
-        fields.push({ name: "Agent Reasoning", value: payload.agentReasoning.slice(0, 1024) });
-      }
-
-      if (payload.suggestedReply) {
-        fields.push({ name: "Suggested Reply", value: payload.suggestedReply.slice(0, 1024) });
-      }
-
-      let description: string | undefined;
-      if (payload.conversationHistory && payload.conversationHistory.length > 0) {
-        const recent = payload.conversationHistory.slice(-5);
-        const lines = recent.map((msg) => {
-          const role = msg.role === "user" ? "Customer" : msg.role === "assistant" ? "Agent" : msg.role;
-          return `**${role}:** ${msg.content.slice(0, 200)}`;
-        });
-        description = lines.join("\n\n").slice(0, 2048);
-      }
-
-      const embeds: DiscordEmbed[] = [
-        {
-          title: `Escalation from ${payload.agentName}`,
-          description,
-          color: COLORS.YELLOW,
-          fields,
-          footer: { text: "Paperclip Escalation" },
-          timestamp: new Date().toISOString(),
-        },
-      ];
-
-      const buttons: DiscordComponent[] = [];
-      const cid = payload.companyId || "default";
-
-      if (payload.suggestedReply) {
-        buttons.push({
-          type: 2,
-          style: 3,
-          label: "Use Suggested Reply",
-          custom_id: `esc_suggest_${cid}_${payload.escalationId}`,
-        });
-      }
-
-      buttons.push(
-        { type: 2, style: 1, label: "Reply to Customer", custom_id: `esc_reply_${cid}_${payload.escalationId}` },
-        { type: 2, style: 2, label: "Override Agent", custom_id: `esc_override_${cid}_${payload.escalationId}` },
-        { type: 2, style: 4, label: "Dismiss", custom_id: `esc_dismiss_${cid}_${payload.escalationId}` },
-      );
-
-      const components: DiscordComponent[] = [{ type: 1, components: buttons }];
-      return { embeds, components };
-    }
-
-    if (config.enableEscalations !== false) {
-      ctx.events.on(`plugin.${PLUGIN_ID}.escalation-created`, async (event: PluginEvent) => {
-        if (isDuplicate(event.eventId)) {
-          ctx.logger.debug(`Skipping duplicate escalation event (${event.eventId})`);
-          return;
-        }
-
-        const payload = event.payload as unknown as EscalationCreatedPayload;
-        const escalationId = payload.escalationId || event.entityId || "";
-        payload.escalationId = escalationId;
-
-        const channelId = await resolveChannel(ctx, event.companyId, escalationChannelId);
-        if (!channelId) return;
-
-        const { embeds, components } = buildEscalationEmbed(payload);
-        const messageId = await adapter.sendButtons(channelId, embeds, components);
-
-        if (messageId) {
-          const record: EscalationRecord = {
-            escalationId,
-            companyId: event.companyId,
-            agentName: payload.agentName,
-            reason: payload.reason,
-            confidenceScore: payload.confidenceScore,
-            agentReasoning: payload.agentReasoning,
-            conversationHistory: payload.conversationHistory,
-            suggestedReply: payload.suggestedReply,
-            channelId,
-            messageId,
-            status: "pending",
-            createdAt: new Date().toISOString(),
-          };
-          await _saveEscalation(record);
-          await _trackPending(escalationId, event.companyId);
-          await ctx.metrics.write(METRIC_NAMES.escalationsCreated, 1);
-
-          await ctx.activity.log({
-            companyId: event.companyId,
-            message: `Escalation created by ${payload.agentName}: ${payload.reason.slice(0, 100)}`,
-            entityType: "escalation",
-            entityId: escalationId,
-          });
-
-          ctx.logger.info("Escalation posted to Discord", { escalationId, channelId, messageId });
-        }
-      });
-    }
+    });
 
     // --- Phase 1: escalate_to_human tool (3-arg register with ToolRunContext) ---
 
@@ -929,6 +1278,9 @@ const plugin = definePlugin({
         const escalationId = `esc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const escalationCompanyId = String(p.companyId || runCtx.companyId);
 
+        const rt = await ensureRuntime(ctx, escalationCompanyId);
+        if (!rt) return { error: RUNTIME_NOT_READY_MESSAGE };
+
         const payload: EscalationCreatedPayload = {
           escalationId,
           companyId: escalationCompanyId,
@@ -940,13 +1292,13 @@ const plugin = definePlugin({
           suggestedReply: p.suggestedReply ? String(p.suggestedReply) : undefined,
         };
 
-        const channelId = await resolveChannel(ctx, escalationCompanyId, escalationChannelId);
+        const channelId = await resolveChannel(ctx, escalationCompanyId, rt.escalationChannelId);
         if (!channelId) {
           return { error: "No escalation channel configured." };
         }
 
         const { embeds, components } = buildEscalationEmbed(payload);
-        const messageId = await adapter.sendButtons(channelId, embeds, components);
+        const messageId = await rt.adapter.sendButtons(channelId, embeds, components);
 
         if (messageId) {
           const record: EscalationRecord = {
@@ -1000,10 +1352,12 @@ const plugin = definePlugin({
         },
       },
       async (params, runCtx) => {
+        const rt = await ensureRuntime(ctx, runCtx.companyId);
+        if (!rt) return { error: RUNTIME_NOT_READY_MESSAGE };
         const p = params as Record<string, unknown>;
         const result = await initiateHandoff(
           ctx,
-          token,
+          rt.token,
           String(p.threadId),
           String(p.fromAgent),
           String(p.toAgent),
@@ -1040,10 +1394,12 @@ const plugin = definePlugin({
         },
       },
       async (params, runCtx) => {
+        const rt = await ensureRuntime(ctx, runCtx.companyId);
+        if (!rt) return { error: RUNTIME_NOT_READY_MESSAGE };
         const p = params as Record<string, unknown>;
         const result = await startDiscussion(
           ctx,
-          token,
+          rt.token,
           String(p.threadId),
           String(p.initiator),
           String(p.target),
@@ -1068,6 +1424,8 @@ const plugin = definePlugin({
 
     ctx.jobs.register("check-escalation-timeouts", async () => {
       const jobCompanyId = await resolveCompanyId(ctx);
+      const rt = await ensureRuntime(ctx, jobCompanyId);
+      if (!rt) return;
       const pendingIds = await collectPendingEscalationIds(ctx, jobCompanyId);
       if (pendingIds.length === 0) return;
 
@@ -1081,7 +1439,7 @@ const plugin = definePlugin({
         }
 
         const elapsed = now - new Date(record.createdAt).getTime();
-        if (elapsed < escalationTimeoutMs) continue;
+        if (elapsed < rt.escalationTimeoutMs) continue;
 
         record.status = "timed_out";
         record.resolvedAt = new Date().toISOString();
@@ -1089,11 +1447,11 @@ const plugin = definePlugin({
         await _untrackPending(escalationId, record.companyId || jobCompanyId);
         await ctx.metrics.write(METRIC_NAMES.escalationsTimedOut, 1);
 
-        await adapter.editMessage(record.channelId, record.messageId, {
+        await rt.adapter.editMessage(record.channelId, record.messageId, {
           embeds: [
             {
               title: `Escalation from ${record.agentName} - TIMED OUT`,
-              description: `This escalation was not resolved within ${config.escalationTimeoutMinutes || 30} minutes.`,
+              description: `This escalation was not resolved within ${rt.config.escalationTimeoutMinutes || 30} minutes.`,
               color: COLORS.RED,
               fields: [{ name: "Reason", value: record.reason.slice(0, 1024) }],
               footer: { text: "Paperclip Escalation" },
@@ -1120,6 +1478,8 @@ const plugin = definePlugin({
 
     ctx.jobs.register("check-budget-thresholds", async () => {
       const jobCompanyId = await resolveCompanyId(ctx);
+      const rt = await ensureRuntime(ctx, jobCompanyId);
+      if (!rt) return;
       const agents = await ctx.agents.list({ companyId: jobCompanyId });
 
       for (const agent of agents) {
@@ -1156,7 +1516,7 @@ const plugin = definePlugin({
         const channelId = await resolveChannel(
           ctx,
           jobCompanyId,
-          errorsChannelId ?? defaultChannelId,
+          rt.errorsChannelId ?? rt.defaultChannelId,
         );
         if (!channelId) continue;
 
@@ -1169,7 +1529,7 @@ const plugin = definePlugin({
           pct: pctRounded,
         });
 
-        await postEmbed(ctx, token, channelId, message);
+        await postEmbed(ctx, rt.token, channelId, message);
 
         // Record that we sent the alert for this billing cycle
         await ctx.state.set(
@@ -1186,101 +1546,109 @@ const plugin = definePlugin({
     // Phase 4: Custom Commands tool (3-arg register)
     // ===================================================================
 
-    if (config.enableCustomCommands !== false) {
-      ctx.tools.register(
-        "register_custom_command",
-        {
-          displayName: "Register Custom Command",
-          description: "Register a custom !command for Discord users to invoke.",
-          parametersSchema: {
-            type: "object",
-            properties: {
-              companyId: { type: "string", description: "Company ID" },
-              command: { type: "string", description: "Command name (without !)" },
-              description: { type: "string", description: "Description" },
-              parameters: {
-                type: "array",
-                items: { type: "object", properties: { name: { type: "string" }, description: { type: "string" }, required: { type: "boolean" } } },
-                description: "Parameters",
-              },
+    ctx.tools.register(
+      "register_custom_command",
+      {
+        displayName: "Register Custom Command",
+        description: "Register a custom !command for Discord users to invoke.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            companyId: { type: "string", description: "Company ID" },
+            command: { type: "string", description: "Command name (without !)" },
+            description: { type: "string", description: "Description" },
+            parameters: {
+              type: "array",
+              items: { type: "object", properties: { name: { type: "string" }, description: { type: "string" }, required: { type: "boolean" } } },
+              description: "Parameters",
             },
-            required: ["companyId", "command", "description"],
           },
+          required: ["companyId", "command", "description"],
         },
-        async (params, runCtx) => {
-          const p = params as Record<string, unknown>;
-          const result = await registerCommand(
-            ctx,
-            String(p.companyId || runCtx.companyId),
-            String(p.command),
-            String(p.description),
-            (p.parameters as Array<{ name: string; description: string; required: boolean }>) ?? [],
-            runCtx.agentId,
-            String(p.agentName ?? runCtx.agentId),
-          );
-          return { content: JSON.stringify(result) };
-        },
-      );
-    }
+      },
+      async (params, runCtx) => {
+        const rt = await ensureRuntime(ctx, runCtx.companyId);
+        if (!rt) return { error: RUNTIME_NOT_READY_MESSAGE };
+        if (rt.config.enableCustomCommands === false) {
+          return { error: "Custom commands are disabled in this plugin configuration." };
+        }
+        const p = params as Record<string, unknown>;
+        const result = await registerCommand(
+          ctx,
+          String(p.companyId || runCtx.companyId),
+          String(p.command),
+          String(p.description),
+          (p.parameters as Array<{ name: string; description: string; required: boolean }>) ?? [],
+          runCtx.agentId,
+          String(p.agentName ?? runCtx.agentId),
+        );
+        return { content: JSON.stringify(result) };
+      },
+    );
 
     // ===================================================================
     // Phase 5: Proactive Suggestions tool (3-arg register)
     // ===================================================================
 
-    if (config.enableProactiveSuggestions !== false) {
-      ctx.tools.register(
-        "register_watch",
-        {
-          displayName: "Register Watch",
-          description: "Register a watch condition that fires proactive suggestions.",
-          parametersSchema: {
-            type: "object",
-            properties: {
-              companyId: { type: "string", description: "Company ID" },
-              watchName: { type: "string", description: "Watch name" },
-              patterns: { type: "array", items: { type: "string" }, description: "Regex patterns" },
-              channelIds: { type: "array", items: { type: "string" }, description: "Channel IDs (empty = all)" },
-              responseTemplate: { type: "string", description: "Suggestion template" },
-              cooldownMinutes: { type: "number", description: "Cooldown minutes (default 60)" },
-            },
-            required: ["companyId", "watchName", "patterns", "responseTemplate"],
+    ctx.tools.register(
+      "register_watch",
+      {
+        displayName: "Register Watch",
+        description: "Register a watch condition that fires proactive suggestions.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            companyId: { type: "string", description: "Company ID" },
+            watchName: { type: "string", description: "Watch name" },
+            patterns: { type: "array", items: { type: "string" }, description: "Regex patterns" },
+            channelIds: { type: "array", items: { type: "string" }, description: "Channel IDs (empty = all)" },
+            responseTemplate: { type: "string", description: "Suggestion template" },
+            cooldownMinutes: { type: "number", description: "Cooldown minutes (default 60)" },
           },
+          required: ["companyId", "watchName", "patterns", "responseTemplate"],
         },
-        async (params, runCtx) => {
-          const p = params as Record<string, unknown>;
-          const result = await registerWatch(
-            ctx,
-            String(p.companyId || runCtx.companyId),
-            String(p.watchName),
-            (p.patterns as string[]) ?? [],
-            (p.channelIds as string[]) ?? [],
-            String(p.responseTemplate),
-            p.cooldownMinutes ? Number(p.cooldownMinutes) : 60,
-            runCtx.agentId,
-            String(p.agentName ?? runCtx.agentId),
-          );
-          return { content: JSON.stringify(result) };
-        },
-      );
-
-    }
+      },
+      async (params, runCtx) => {
+        const rt = await ensureRuntime(ctx, runCtx.companyId);
+        if (!rt) return { error: RUNTIME_NOT_READY_MESSAGE };
+        if (rt.config.enableProactiveSuggestions === false) {
+          return { error: "Proactive suggestions are disabled in this plugin configuration." };
+        }
+        const p = params as Record<string, unknown>;
+        const result = await registerWatch(
+          ctx,
+          String(p.companyId || runCtx.companyId),
+          String(p.watchName),
+          (p.patterns as string[]) ?? [],
+          (p.channelIds as string[]) ?? [],
+          String(p.responseTemplate),
+          p.cooldownMinutes ? Number(p.cooldownMinutes) : 60,
+          runCtx.agentId,
+          String(p.agentName ?? runCtx.agentId),
+        );
+        return { content: JSON.stringify(result) };
+      },
+    );
 
     ctx.jobs.register("check-watches", async () => {
-      if (config.enableProactiveSuggestions === false) {
+      const cid = await resolveCompanyId(ctx);
+      const rt = await ensureRuntime(ctx, cid);
+      if (!rt) return;
+      if (rt.config.enableProactiveSuggestions === false) {
         ctx.logger.debug("check-watches: proactive suggestions disabled, skipping");
         return;
       }
-      const cid = await resolveCompanyId(ctx);
-      await checkWatches(ctx, token, cid, defaultChannelId);
+      await checkWatches(ctx, rt.token, cid, rt.defaultChannelId);
     });
 
     // ===================================================================
     // Daily Digest Job
     // ===================================================================
 
-    const effectiveDigestMode = config.digestMode ?? "off";
-
     ctx.jobs.register("discord-daily-digest", async () => {
+      const rt = await ensureRuntime(ctx);
+      if (!rt) return;
+      const effectiveDigestMode = rt.digestMode;
       if (effectiveDigestMode === "off") {
         ctx.logger.debug("discord-daily-digest: digest mode is off, skipping");
         return;
@@ -1293,9 +1661,9 @@ const plugin = definePlugin({
         const [h] = (t || "").split(":");
         return parseInt(h ?? "", 10);
       };
-      const firstHour = parseHour(config.dailyDigestTime || "09:00");
-      const secondHour = parseHour(config.bidailySecondTime || "17:00");
-      const tridailyHours = (config.tridailyTimes || "07:00,13:00,19:00")
+      const firstHour = parseHour(rt.config.dailyDigestTime || "09:00");
+      const secondHour = parseHour(rt.config.bidailySecondTime || "17:00");
+      const tridailyHours = (rt.config.tridailyTimes || "07:00,13:00,19:00")
         .split(",")
         .map((t) => parseHour(t.trim()));
 
@@ -1311,7 +1679,7 @@ const plugin = definePlugin({
 
       const companies = await ctx.companies.list();
       for (const company of companies) {
-        const channelId = await resolveChannel(ctx, company.id, defaultChannelId);
+        const channelId = await resolveChannel(ctx, company.id, rt.defaultChannelId);
         if (!channelId) continue;
 
         try {
@@ -1388,7 +1756,7 @@ const plugin = definePlugin({
 
             const digestComponents: DiscordComponent[] = [];
             const digestButtons: DiscordComponent[] = [
-              { type: 2, style: 5, label: "View Dashboard", url: baseUrl },
+              { type: 2, style: 5, label: "View Dashboard", url: rt.baseUrl },
             ];
             if (blocked.length > 0) {
               digestButtons.push({
@@ -1410,11 +1778,11 @@ const plugin = definePlugin({
               },
             ];
 
-            await postEmbed(ctx, token, channelId, { embeds, components: digestComponents });
+            await postEmbed(ctx, rt.token, channelId, { embeds, components: digestComponents });
             await ctx.metrics.write(METRIC_NAMES.digestSent, 1);
           } catch (err) {
             ctx.logger.error("Daily digest failed for company", { companyId: company.id, error: String(err) });
-            await postEmbed(ctx, token, channelId, {
+            await postEmbed(ctx, rt.token, channelId, {
               embeds: [{
                 title: "📊 Daily Digest",
                 description: "Could not generate digest. Check plugin logs for details.",
@@ -1427,11 +1795,7 @@ const plugin = definePlugin({
       }
     });
 
-    if (effectiveDigestMode === "off") {
-      ctx.logger.debug("Daily digest job registered (inactive)", { mode: effectiveDigestMode });
-    } else {
-      ctx.logger.info("Daily digest job registered", { mode: effectiveDigestMode });
-    }
+    ctx.logger.debug("Daily digest job registered; digest mode is read from the live config at run time");
 
     // --- Per-company channel overrides ---
 
@@ -1442,7 +1806,7 @@ const plugin = definePlugin({
         scopeId: cid,
         stateKey: "discord-channel",
       });
-      return { channelId: normalizeDiscordId(saved) ?? defaultChannelId };
+      return { channelId: normalizeDiscordId(saved) ?? runtime?.defaultChannelId ?? "" };
     });
 
     ctx.actions.register("set-channel", async (params) => {
@@ -1505,73 +1869,66 @@ const plugin = definePlugin({
     // --- Intelligence: scheduled scan ---
 
     ctx.jobs.register("discord-intelligence-scan", async () => {
-      if (!config.enableIntelligence || intelligenceChannelIds.length === 0 || !defaultGuildId) {
+      const cid = await resolveCompanyId(ctx);
+      const rt = await ensureRuntime(ctx, cid);
+      if (!rt) return;
+      if (!rt.config.enableIntelligence || rt.intelligenceChannelIds.length === 0 || !rt.defaultGuildId) {
         ctx.logger.debug("discord-intelligence-scan: intelligence disabled or no channels configured, skipping");
         return;
       }
-      const cid = await resolveCompanyId(ctx);
       await runIntelligenceScan(
         ctx,
-        token,
-        defaultGuildId,
-        intelligenceChannelIds,
+        rt.token,
+        rt.defaultGuildId,
+        rt.intelligenceChannelIds,
         cid,
-        retentionDays,
+        rt.retentionDays,
       );
     });
-    if (config.enableIntelligence && intelligenceChannelIds.length > 0) {
-      ctx.logger.info("Intelligence scan job registered", {
-        channels: intelligenceChannelIds.length,
-      });
-    }
 
     // --- Backfill ---
+    //
+    // The first-install backfill is fired from the runtime bootstrap (it needs a
+    // bot token). This action re-runs it on demand and is registered
+    // unconditionally, because whether intelligence is enabled is only known once
+    // the runtime exists.
 
-    if (config.enableIntelligence && intelligenceChannelIds.length > 0 && defaultGuildId) {
-      // Backfill also deferred to avoid startup-time company resolution.
-      // It runs as an async task after setup completes.
-      const tryBackfill = async () => {
-        const cid = await resolveCompanyId(ctx);
-        const existing = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: cid,
-          stateKey: "discord_intelligence",
-        }) as { backfillComplete?: boolean } | null;
+    ctx.actions.register("trigger-backfill", async () => {
+      const cid = await resolveCompanyId(ctx);
+      const rt = await ensureRuntime(ctx, cid);
+      if (!rt) return { ok: false, error: RUNTIME_NOT_READY_MESSAGE };
+      if (!rt.config.enableIntelligence || rt.intelligenceChannelIds.length === 0 || !rt.defaultGuildId) {
+        return { ok: false, error: "Intelligence is disabled or no intelligence channels are configured." };
+      }
+      await ctx.state.set(
+        { scopeKind: "company", scopeId: cid, stateKey: "discord_intelligence" },
+        { signals: [], backfillComplete: false },
+      );
+      const signals = await runBackfill(
+        ctx,
+        rt.token,
+        rt.defaultGuildId,
+        rt.intelligenceChannelIds,
+        cid,
+        rt.config.backfillDays ?? 90,
+      );
+      return { ok: true, signalsFound: signals.length };
+    });
 
-        if (!existing?.backfillComplete) {
-          ctx.logger.info("First install detected, starting historical backfill...");
-          await runBackfill(
-            ctx,
-            token,
-            defaultGuildId,
-            intelligenceChannelIds,
-            cid,
-            config.backfillDays ?? 90,
-          );
-        }
-      };
-      // Fire-and-forget so it doesn't block setup completion.
-      tryBackfill().catch((err) => ctx.logger.warn("Backfill failed", { error: String(err) }));
-
-      ctx.actions.register("trigger-backfill", async () => {
-        const cid = await resolveCompanyId(ctx);
-        await ctx.state.set(
-          { scopeKind: "company", scopeId: cid, stateKey: "discord_intelligence" },
-          { signals: [], backfillComplete: false },
-        );
-        const signals = await runBackfill(
-          ctx,
-          token,
-          defaultGuildId,
-          intelligenceChannelIds,
-          cid,
-          config.backfillDays ?? 90,
-        );
-        return { ok: true, signalsFound: signals.length };
-      });
+    // Best-effort startup walk: on a host that seeds proactive company scopes
+    // (>= 2026.817.0) this starts the runtime right away. On 2026.720/722 it is
+    // denied for every company and the plugin waits for onConfigChanged instead.
+    // It must never throw: a throw here fails worker activation.
+    try {
+      await ensureRuntime(ctx);
+    } catch (err) {
+      ctx.logger.warn("Discord plugin startup bootstrap failed", { error: summarizeError(err) });
     }
 
-    ctx.logger.info("Discord bot plugin started (all 5 phases active)");
+    ctx.logger.info("Discord plugin setup complete", {
+      runtimeStarted: runtime !== null,
+      companyId: runtime?.companyId,
+    });
   },
 
   async onWebhook(input: PluginWebhookInput): Promise<void> {
@@ -1580,7 +1937,9 @@ const plugin = definePlugin({
       if (!body) return;
 
       const ctx = _pluginCtx;
-      const cmdCtx = _cmdCtx;
+      // An interaction always carries a guild/company-agnostic payload, so the
+      // runtime can only be bootstrapped opportunistically here.
+      const cmdCtx = (await ensureRuntime(ctx))?.cmdCtx ?? null;
 
       if (!ctx || !cmdCtx) {
         // Return a valid Discord interaction response even before setup completes.
@@ -1608,11 +1967,9 @@ const plugin = definePlugin({
   },
 
   async onValidateConfig(config) {
-    if (
-      !config.discordBotTokenRef ||
-      typeof config.discordBotTokenRef !== "string" ||
-      !config.discordBotTokenRef.trim()
-    ) {
+    // Accepts both stored shapes: the settings picker's secret binding
+    // ({ type: "secret_ref", secretId }) and a legacy bare secret UUID string.
+    if (!isUsableSecretRef(config.discordBotTokenRef)) {
       return { ok: false, errors: [`[${PLUGIN_ID}] discordBotTokenRef is required`] };
     }
     if (
@@ -1623,6 +1980,58 @@ const plugin = definePlugin({
       return { ok: false, errors: [`[${PLUGIN_ID}] defaultChannelId is required`] };
     }
     return { ok: true };
+  },
+
+  /**
+   * The host delivers stored config here — at worker startup and on every save —
+   * WITH its company scope. On a 2026.720/722 host this is the only path that can
+   * start the runtime, because scoped `config.get()` is denied there for every
+   * company. `companyId` is null for an instance/global save; resolve a scope
+   * ourselves in that case, since `secrets.resolve` needs one.
+   */
+  async onConfigChanged(newConfig, context): Promise<void> {
+    const ctx = _pluginCtx;
+    if (!ctx) return;
+
+    let companyId = context?.companyId ?? null;
+    if (!companyId) {
+      companyId = runtime?.companyId ?? null;
+      if (!companyId) {
+        try {
+          const companies = await ctx.companies.list();
+          companyId = companies[0]?.id ?? null;
+        } catch (err) {
+          ctx.logger.warn("Config change delivered without a company scope and companies could not be listed", {
+            error: summarizeError(err),
+          });
+        }
+      }
+      if (companyId) {
+        ctx.logger.info("Config change delivered without a company scope; resolved one for secret resolution", {
+          companyId,
+        });
+      }
+    }
+
+    if (!companyId) {
+      degradeHealth(
+        "Configuration was delivered without a company scope and no company could be resolved; secrets cannot be resolved",
+        "discord-config-scope-unknown",
+      );
+      return;
+    }
+
+    // A delivery is fresh information: let opportunistic bootstraps retry too.
+    nextOpportunisticBootstrapAt = 0;
+    try {
+      await bootstrapRuntime(ctx, companyId, newConfig);
+    } catch (err) {
+      const error = summarizeError(err);
+      ctx.logger.error("Discord plugin failed to apply a configuration change", { error, companyId });
+      degradeHealth(`Applying the delivered configuration failed: ${error}`, "discord-config-apply-failed", {
+        companyId,
+      });
+    }
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {

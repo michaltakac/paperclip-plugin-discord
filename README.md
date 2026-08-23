@@ -166,8 +166,22 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -d '{"packageName":"paperclip-plugin-discord"}'
 ```
 
-> **Note — `paperclipai` master, post [#5429](https://github.com/paperclipai/paperclip/pull/5429) (2026-05-09):**
-> The new Secrets Manager ships with a temporary kill switch on plugin secret-ref UUIDs while a company-scoped `plugin_config` follow-up lands. If you're running paperclipai master, plugin activation will fail with `Plugin secret references are disabled until company-scoped plugin config lands`, and `POST /api/plugins/:id/config` returns HTTP 422 for configs containing secret-ref UUIDs (e.g. `discordBotTokenRef`). This is intentional fail-closed mitigation (PAP-2394 — see the [upstream plan doc](https://github.com/paperclipai/paperclip/blob/master/doc/plans/2026-04-26-plugin-secret-ref-company-scope.md)). Until the follow-up lands, pin to the last paperclipai release before #5429. This callout will be removed once secret-ref resolution is restored.
+### Host compatibility
+
+This plugin needs a Paperclip host at **v2026.720.0 or newer**. Since
+[paperclipai/paperclip#9557](https://github.com/paperclipai/paperclip/pull/9557) the plugin SDK
+requires a company scope for every `config.get` and `secrets.resolve` call, and the plugin is built
+around that rule: it registers its handlers at startup and starts its Discord runtime once the host
+hands it a company's configuration.
+
+| Host version | What happens |
+|---|---|
+| < v2026.720.0 | The secret-ref kill switch blocks token resolution. The plugin activates, health reports `degraded` with the host's error, and no Discord connection is made. Upgrade the host. |
+| v2026.720.0 / v2026.722.0 | The runtime starts when the host delivers the configuration — **save the plugin configuration once after installing**, and the Discord connection comes up without restarting the worker. |
+| >= v2026.817.0 | The runtime starts at worker boot: the host seeds company scopes for companies that already have a stored configuration ([#10113](https://github.com/paperclipai/paperclip/pull/10113)). |
+
+While no configuration has reached the plugin, plugin health reports `degraded` and names the reason
+the host gave. That is the first place to look if Discord stays silent after an install.
 
 ## Troubleshooting: confirm your Paperclip host
 
@@ -179,19 +193,22 @@ Before filing a bug, confirm which Paperclip host this plugin is actually talkin
 2. Add a bot to the application and copy the bot token
 3. Enable the MESSAGE CONTENT privileged intent (for intelligence scanning)
 4. Invite the bot to your server with `applications.commands` and `bot` scopes
-5. In Paperclip, create a **company secret** holding your bot token, by either:
+5. In Paperclip, store the bot token as a **company secret**, by either:
 
-   - **UI:** Open any agent's **Configuration → Environment variables**, enter a name (e.g. `discord-bot-token`) and the bot token as the value, then click **Create / Seal**. The secret is created at the **company level** (not bound to that agent — despite the agent-context UI) and the returned UUID can be used from any plugin in the company.
-   - **REST API:** `POST /api/companies/{companyId}/secrets` with body `{"name": "discord-bot-token", "value": "<your-bot-token>", "provider": "local_encrypted"}`. The response contains the secret's UUID.
-
-   Copy the resulting secret UUID — you'll paste it into `discordBotTokenRef` in the next step.
-6. Configure the plugin with the secret UUID in `discordBotTokenRef`, your guild ID, and channel ID
+   - **UI:** Open any agent's **Configuration → Environment variables**, enter a name (e.g. `discord-bot-token`) and the bot token as the value, then click **Create / Seal**. The secret is created at the **company level** (not bound to that agent — despite the agent-context UI) and is available to any plugin in that company.
+   - **REST API:** `POST /api/companies/{companyId}/secrets` with body `{"name": "discord-bot-token", "value": "<your-bot-token>", "provider": "local_encrypted"}`.
+6. Open **Plugin Settings for Discord Bot** and select that secret in **Discord Bot Token** using the
+   secret picker. Do not type or paste a secret UUID into the field: the picker stores a secret
+   binding (`{"type": "secret_ref", "secretId": "..."}`), which is the shape the host accepts. Set
+   your guild ID and default channel ID in the same form, then save.
+7. Saving the configuration is what starts the Discord runtime on a v2026.720.0 / v2026.722.0 host.
+   Check plugin health afterwards: `ok` means the bot is connected, `degraded` carries the reason.
 
 ## Configuration
 
 | Setting | Required | Description |
 |---------|----------|-------------|
-| `discordBotTokenRef` | Yes | Secret reference to your Discord bot token |
+| `discordBotTokenRef` | Yes | Your Discord bot token, selected with the secret picker |
 | `defaultChannelId` | Yes | Default channel for notifications |
 | `defaultGuildId` | No | Server ID (required for slash commands and intelligence) |
 | `approvalsChannelId` | No | Dedicated channel for approvals |
@@ -260,16 +277,28 @@ Brings the Discord plugin to full parity with the Telegram plugin across 14 feat
 
 ## Migration
 
+### Company-scoped configuration and secret bindings
+
+Secret-reference fields (`discordBotTokenRef`, `paperclipBoardApiKeyRef`) now accept the secret
+binding written by the settings secret picker, which is what current hosts store and validate.
+A configuration saved earlier as a bare secret UUID keeps working — nothing to do — but a host at
+v2026.720.0 or newer will not let you save one, so re-select the secret with the picker the next time
+you edit the plugin configuration.
+
+If the plugin used to activate and now reports `degraded` health after an upgrade, read the health
+message: it carries the host's own error. The usual cause is that no configuration has been delivered
+yet on a v2026.720.0 / v2026.722.0 host — save the plugin configuration once.
+
 ### v0.2.1
 
-The `discordBotTokenRef` field now requires a Paperclip secret reference (a UUID), not the raw token value. If you previously entered a raw bot token in the field, follow these steps to migrate:
+The `discordBotTokenRef` field takes a Paperclip secret reference, not the raw token value. If you
+previously entered a raw bot token in the field:
 
-1. Create a company secret holding your bot token using one of the paths in the [Setup](#setup) section above (UI or REST API).
-2. Copy the returned secret UUID.
-3. Open **Plugin Settings for Discord Bot** and paste the UUID into "Discord Bot Token".
-4. Save and restart the plugin.
+1. Store the bot token as a company secret using one of the paths in the [Setup](#setup) section above (UI or REST API).
+2. Open **Plugin Settings for Discord Bot** and select that secret in "Discord Bot Token" with the secret picker.
+3. Save.
 
-The plugin will fail to activate if a raw token (non-UUID) is entered in the field.
+A raw token in that field is rejected: the host validates it as a secret reference.
 
 ## Development
 
