@@ -136,6 +136,7 @@ function buildHost(options: HostOptions = {}) {
 
   const unscopedConfigReads: number[] = [];
   const stateStore = new Map<string, unknown>();
+  const eventHandlers = new Map<string, any[]>();
   let invocationScope: string | null = null;
   let secretResolutionGate: Promise<void> | null = null;
   let releaseGate: () => void = () => {};
@@ -187,7 +188,15 @@ function buildHost(options: HostOptions = {}) {
     tools: { register: vi.fn() },
     data: { register: vi.fn() },
     actions: { register: vi.fn() },
-    events: { on: vi.fn(), emit: vi.fn(), subscribe: vi.fn() },
+    events: {
+      on: vi.fn((name: string, handler: any) => {
+        const list = eventHandlers.get(name) ?? [];
+        list.push(handler);
+        eventHandlers.set(name, list);
+      }),
+      emit: vi.fn(),
+      subscribe: vi.fn(),
+    },
     companies: {
       // Honours limit/offset like the host, so a walk that only reads the first
       // page is visible as a wrong answer rather than passing by accident.
@@ -208,6 +217,20 @@ function buildHost(options: HostOptions = {}) {
   return {
     ctx,
     unscopedConfigReads,
+    /** Deliver an event to the plugin, as a company-scoped invocation. */
+    async emitEvent(eventType: string, companyId: string) {
+      for (const handler of eventHandlers.get(eventType) ?? []) {
+        await handler({
+          eventId: `evt-${Math.random().toString(36).slice(2)}`,
+          eventType,
+          companyId,
+          entityId: "entity-1",
+          entityType: "issue",
+          occurredAt: new Date().toISOString(),
+          payload: { title: "t", identifier: "T-1" },
+        });
+      }
+    },
     /** Enter or leave a host->worker invocation bound to a company. */
     setInvocationScope(companyId: string | null) {
       invocationScope = companyId;
@@ -461,6 +484,76 @@ describe("host matrix: >= 2026.817.0 (proactive company scopes)", () => {
     const diagnostics = await definition().onHealth();
     expect(diagnostics.status).toBe("degraded");
     expect(diagnostics.details).toMatchObject({ companyId: COMPANY_A });
+  });
+
+  it("refuses to bind a non-owner even when a scoped invocation offers one", async () => {
+    // A owns the worker (lowest company id with a stored row) but its secret no
+    // longer resolves. A company-B event must not sneak B in through the
+    // opportunistic bootstrap: the host would still replay A first and refuse
+    // every B delivery afterwards, leaving B running forever on stale config.
+    const host = buildHost({
+      companies: [COMPANY_A, COMPANY_B],
+      rows: {
+        [COMPANY_A]: storedConfig({ discordBotTokenRef: "" }),
+        [COMPANY_B]: storedConfig(),
+      },
+    });
+
+    await definition().setup(host.ctx);
+    expect(_getRuntimeForTests()).toBeNull();
+
+    // A's startup replay arrives and still fails — which also clears the
+    // opportunistic retry cooldown, so the next invocation may bootstrap.
+    await definition().onConfigChanged(storedConfig({ discordBotTokenRef: "" }), {
+      companyId: COMPANY_A,
+    });
+    expect(_getRuntimeForTests()).toBeNull();
+
+    await host.emitEvent("issue.created", COMPANY_B);
+
+    expect(_getRuntimeForTests()).toBeNull();
+    expect(gatewayConnects).toHaveLength(0);
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(`this install serves ${COMPANY_A}`),
+      expect.anything(),
+    );
+  });
+
+  it("recovers the owner on its next valid save, after a failed bootstrap", async () => {
+    const host = buildHost({
+      companies: [COMPANY_A, COMPANY_B],
+      rows: {
+        [COMPANY_A]: storedConfig({ discordBotTokenRef: "" }),
+        [COMPANY_B]: storedConfig(),
+      },
+    });
+
+    await definition().setup(host.ctx);
+    await host.emitEvent("issue.created", COMPANY_B);
+    expect(_getRuntimeForTests()).toBeNull();
+
+    // A is repaired and saved.
+    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(await definition().onHealth()).toEqual({ status: "ok" });
+  });
+
+  it("lets the first delivered company own a fresh install with no configured rows", async () => {
+    // Nothing is configured yet, so the walk selects no owner. The first
+    // scoped delivery is then the owner.
+    const { ctx } = buildHost({ companies: [COMPANY_A, COMPANY_B], rows: {} });
+
+    await definition().setup(ctx);
+    expect(_getRuntimeForTests()).toBeNull();
+
+    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_B });
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
+
+    // And A cannot take it over afterwards.
+    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
   });
 
   it("starts from the owner when its configuration is usable", async () => {
@@ -748,7 +841,7 @@ describe("re-bootstrap on configuration changes", () => {
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
     expect(gatewayConnects).toHaveLength(1);
     expect(ctx.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("already bound to a company"),
+      expect.stringContaining(`this install serves ${COMPANY_A}`),
       expect.objectContaining({ runningCompanyId: COMPANY_A, deliveredCompanyId: COMPANY_B }),
     );
   });

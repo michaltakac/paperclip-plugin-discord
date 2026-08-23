@@ -169,9 +169,13 @@ const RUNTIME_NOT_READY_MESSAGE =
 //   3. a best-effort startup walk over `companies.list()` at the end of setup()
 //      (works from 2026.817.0, where the host seeds proactive company scopes).
 //
-// Single-tenant by design: one runtime, bound to the first company with a usable
-// bot token. `multiCompanyConfig` stays unset, so the host fails a second
-// company's config closed instead of silently rebinding this worker.
+// Single-tenant by design: this worker serves ONE company — the first company
+// with a stored configuration row, ordered by company id. Bootstrap success does
+// not decide ownership: an owner whose bot token stopped resolving stays the
+// owner and is the only company that can start this worker. That matches the
+// host, which replays stored rows in that order and records the first delivery
+// as the single tenant. `multiCompanyConfig` stays unset, so the host also fails
+// a second company's config closed rather than silently rebinding this worker.
 
 type DiscordRuntime = {
   companyId: string;
@@ -227,6 +231,18 @@ let bootstrapInFlight: Promise<DiscordRuntime | null> | null = null;
 /** Last host error from a scoped config read, for the degraded-health message. */
 let lastScopedConfigError: string | null = null;
 /**
+ * The company this worker serves, once one has been selected.
+ *
+ * Ownership is decided by the presence of a stored configuration ROW, never by
+ * whether the runtime managed to start from it. It is therefore kept here rather
+ * than read off the live runtime: an owner whose bot token stopped resolving has
+ * no runtime, and forgetting that it is still the owner would let the next
+ * company-scoped invocation bind a different company — which the host would then
+ * refuse to talk to, since it replays the owner's row first and records the first
+ * delivery as the single tenant.
+ */
+let ownerCompanyId: string | null = null;
+/**
  * Company enumeration for the startup walk.
  *
  * One snapshot request, never offset paging: the host re-runs the whole company
@@ -267,6 +283,7 @@ export function _resetRuntimeForTests(): void {
   bootstrapInFlight = null;
   bootstrapQueue = Promise.resolve();
   lastScopedConfigError = null;
+  ownerCompanyId = null;
   nextOpportunisticBootstrapAt = 0;
   seenEvents.clear();
   runtimeHealth = {
@@ -773,6 +790,26 @@ async function handleMessageCreate(
  * Never throws: every failure path degrades health and returns null.
  */
 /**
+ * The single ownership gate. Every bootstrap source goes through it.
+ *
+ * The first company known to have a stored configuration row claims the worker;
+ * afterwards, any other company is logged and refused. Claiming does not require
+ * the runtime to start — that is the whole point of tracking it separately.
+ */
+function claimOwnership(ctx: PluginContext, companyId: string): boolean {
+  if (!ownerCompanyId) {
+    ownerCompanyId = companyId;
+    return true;
+  }
+  if (ownerCompanyId === companyId) return true;
+  ctx.logger.warn(
+    `Discord plugin ignoring configuration for company ${companyId}; this install serves ${ownerCompanyId}`,
+    { runningCompanyId: ownerCompanyId, deliveredCompanyId: companyId },
+  );
+  return false;
+}
+
+/**
  * Apply one company's stored configuration to the runtime.
  *
  * Callers MUST go through `queueBootstrap` — every bootstrap source shares one
@@ -799,14 +836,8 @@ async function bootstrapRuntime(
   companyId: string,
   rawConfig: unknown,
 ): Promise<DiscordRuntime | null> {
+  if (!claimOwnership(ctx, companyId)) return runtime;
   const existing = runtime;
-  if (existing && existing.companyId !== companyId) {
-    ctx.logger.warn(
-      "Discord plugin is already bound to a company; ignoring configuration for another company",
-      { runningCompanyId: existing.companyId, deliveredCompanyId: companyId },
-    );
-    return existing;
-  }
 
   const config = {
     ...DEFAULT_CONFIG,
@@ -825,7 +856,7 @@ async function bootstrapRuntime(
       "discord-bot-token-missing",
       { companyId },
     );
-    ctx.logger.warn("Discord plugin config has no usable bot token reference", { companyId });
+    ctx.logger.warn("Discord plugin config has no resolvable bot token reference", { companyId });
     return null;
   }
 
@@ -1112,6 +1143,9 @@ async function bootstrapFromScopedConfig(
  * walk adopts nobody and waits for the delivery.
  */
 async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRuntime | null> {
+  // An owner selected earlier stays the owner, even if it never started.
+  if (ownerCompanyId) return bootstrapFromScopedConfig(ctx, ownerCompanyId);
+
   const companyIds = await listAllCompanyIds(ctx);
   if (!companyIds) return null;
 
@@ -1270,11 +1304,22 @@ async function ensureRuntime(
   bootstrapInFlight = queueBootstrap(async () => {
     try {
       if (runtime) return runtime;
-      if (companyId) {
-        const started = await bootstrapFromScopedConfig(pluginCtx, companyId);
-        if (started) return started;
+      if (ownerCompanyId) {
+        // The owner is known. A different company's invocation can never claim
+        // the worker; it only gives us another chance to recover the owner.
+        if (companyId && companyId !== ownerCompanyId) {
+          claimOwnership(pluginCtx, companyId);
+        }
+        return await bootstrapFromScopedConfig(pluginCtx, ownerCompanyId);
       }
-      return await bootstrapFromStartupWalk(pluginCtx);
+      // No owner yet: let the walk select one from the stored rows rather than
+      // letting whichever company happened to invoke us claim the worker.
+      const walked = await bootstrapFromStartupWalk(pluginCtx);
+      if (walked || ownerCompanyId) return walked;
+      if (companyId) {
+        return await bootstrapFromScopedConfig(pluginCtx, companyId);
+      }
+      return null;
     } catch (err) {
       pluginCtx.logger.warn("Discord plugin bootstrap attempt failed", { error: summarizeError(err) });
       return null;

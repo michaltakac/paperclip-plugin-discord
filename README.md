@@ -190,7 +190,7 @@ company it belongs to. The plugin identifies the company itself, by probing the 
 from inside that delivery, so a multi-company install still binds to the right one.
 
 This plugin is single-tenant: one install serves one company. When several companies have a stored
-configuration, it binds to the same one the host would — the lowest company ID with a configuration,
+configuration, it binds to the same one the host would — the first company with a stored configuration row, ordered by company ID,
 which is the first the host replays at startup
 ([#10092](https://github.com/paperclipai/paperclip/pull/10092)) — and logs configuration for any
 other company rather than rebinding or disturbing the running one. Running Discord for a second
@@ -333,7 +333,7 @@ pnpm test
 pnpm build
 ```
 
-540 tests covering company-scoped configuration bootstrap across host generations, formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
+543 tests covering company-scoped configuration bootstrap across host generations, formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
 
 ## Contributing
 
