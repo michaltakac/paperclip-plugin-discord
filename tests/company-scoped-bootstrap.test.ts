@@ -193,6 +193,7 @@ function buildHost(options: HostOptions = {}) {
       // page is visible as a wrong answer rather than passing by accident.
       list: vi.fn(async (input?: { limit?: number; offset?: number }) => {
         if (companiesThrow) throw new Error("companies.list is unavailable");
+        // Like the host: re-run the whole query, then window it in memory.
         const all = companies.map((id) => ({ id, name: `Company ${id.slice(0, 4)}` }));
         if (!input?.limit) return all;
         const offset = input.offset ?? 0;
@@ -438,33 +439,61 @@ describe("host matrix: >= 2026.817.0 (proactive company scopes)", () => {
     expect(_getRuntimeForTests()?.companyId).toBe("a-company");
   });
 
-  it("pages through companies until a short page", async () => {
+  it("enumerates companies with a single snapshot request, never offset paging", async () => {
+    // The host re-runs the whole company query per request and slices it in
+    // memory (applyWindow), and that query has no ORDER BY — so two paged reads
+    // cannot be related to each other and cannot prove the set was fully seen.
     const many = Array.from({ length: 250 }, (_, i) => `company-${String(i).padStart(3, "0")}`);
-    const { ctx } = buildHost({ companies: many, rows: { "company-249": storedConfig() } });
+    const { ctx } = buildHost({ companies: many, rows: { "company-000": storedConfig() } });
 
     await definition().setup(ctx);
 
-    expect(_getRuntimeForTests()?.companyId).toBe("company-249");
-    const requestedOffsets = ctx.companies.list.mock.calls.map((call: any[]) => call[0]?.offset);
-    expect(requestedOffsets).toEqual([0, 100, 200]);
+    expect(ctx.companies.list).toHaveBeenCalledTimes(1);
+    expect(ctx.companies.list).toHaveBeenCalledWith({ limit: 1001, offset: 0 });
+    expect(_getRuntimeForTests()?.companyId).toBe("company-000");
   });
 
-  it("skips company selection instead of guessing when the tenant is too large", async () => {
-    // Enumerating an unbounded company list is not worth it; wait for a delivery.
-    const many = Array.from({ length: 1200 }, (_, i) => `company-${String(i).padStart(4, "0")}`);
+  it("selects no owner and probes nothing when the tenant exceeds the snapshot cap", async () => {
+    const many = Array.from({ length: 1001 }, (_, i) => `company-${String(i).padStart(4, "0")}`);
     const { ctx } = buildHost({ companies: many, rows: { "company-0000": storedConfig() } });
 
     await definition().setup(ctx);
 
     expect(_getRuntimeForTests()).toBeNull();
+    expect(ctx.config.get).not.toHaveBeenCalled();
     expect(ctx.logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("more companies than it will enumerate"),
-      expect.objectContaining({ hardCap: 1000 }),
+      expect.objectContaining({ cap: 1000 }),
     );
 
     // A delivery still starts it.
     await definition().onConfigChanged(storedConfig(), { companyId: "company-0000" });
     expect(_getRuntimeForTests()?.companyId).toBe("company-0000");
+  });
+
+  it("selects no owner when the listing itself fails", async () => {
+    const { ctx } = buildHost({ companiesThrow: true });
+
+    await definition().setup(ctx);
+
+    expect(_getRuntimeForTests()).toBeNull();
+    expect(ctx.config.get).not.toHaveBeenCalled();
+  });
+
+  it("stops probing after the prefix limit rather than binding to a late company", async () => {
+    // The probe prefix is a true prefix of the same sorted set the host replays
+    // from, so anything it adopts is the host's choice too. A configuration that
+    // sits past the limit waits for the delivery instead of being mis-adopted.
+    const many = Array.from({ length: 40 }, (_, i) => `company-${String(i).padStart(2, "0")}`);
+    const { ctx } = buildHost({ companies: many, rows: { "company-39": storedConfig() } });
+
+    await definition().setup(ctx);
+
+    expect(_getRuntimeForTests()).toBeNull();
+    expect(ctx.config.get).toHaveBeenCalledTimes(25);
+
+    await definition().onConfigChanged(storedConfig(), { companyId: "company-39" });
+    expect(_getRuntimeForTests()?.companyId).toBe("company-39");
   });
 
   it("fresh install: the walk finds nothing, then a config save bootstraps it", async () => {

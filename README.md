@@ -180,7 +180,7 @@ hands it a company's configuration.
 |---|---|
 | < v2026.720.0 | The secret-ref kill switch blocks token resolution. The plugin activates and health reports `degraded` with the host's error, but no Discord connection is made. Upgrade the host. |
 | v2026.720.0 / v2026.722.0 | The plugin activates, and the configuration applies when you save it — **but it is not retained across a worker restart.** Those hosts only send a plugin its configuration on an operator save; replaying stored configuration at worker start arrived in v2026.817.0. After every restart of the plugin worker, open the plugin settings and save again. |
-| >= v2026.817.0 | The runtime starts at worker boot: the host seeds company scopes for companies that already have a stored configuration and replays it to the worker ([#10113](https://github.com/paperclipai/paperclip/pull/10113)). Nothing to do after an install beyond saving the configuration once. |
+| >= v2026.817.0 | The runtime starts at worker boot: the host seeds company scopes for companies that already have a stored configuration and replays it to the worker ([#10092](https://github.com/paperclipai/paperclip/pull/10092), [#10113](https://github.com/paperclipai/paperclip/pull/10113)). Nothing to do after an install beyond saving the configuration once. |
 
 While no configuration has reached the plugin, plugin health reports `degraded` and names the reason
 the host gave. That is the first place to look if Discord stays silent after an install.
@@ -191,7 +191,7 @@ from inside that delivery, so a multi-company install still binds to the right o
 
 This plugin is single-tenant: one install serves one company. When several companies have a stored
 configuration, it binds to the same one the host would — the lowest company ID with a configuration,
-which is the first the host replays at startup — and logs the others rather than rebinding. Running
+which is the first the host replays at startup ([#10092](https://github.com/paperclipai/paperclip/pull/10092)) — and logs the others rather than rebinding. Running
 Discord for a second company needs a second plugin install.
 
 ## Troubleshooting: confirm your Paperclip host

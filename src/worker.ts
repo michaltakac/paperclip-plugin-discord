@@ -232,9 +232,20 @@ let lastScopedConfigError: string | null = null;
  */
 let runtimeAdoptionSequence = 0;
 
-/** Company enumeration for the startup walk. */
-const COMPANY_PAGE_SIZE = 100;
-const COMPANY_WALK_HARD_CAP = 1000;
+/**
+ * Company enumeration for the startup walk.
+ *
+ * One snapshot request, never offset paging: the host re-runs the whole company
+ * query per request and slices it in memory (`applyWindow` in
+ * server/src/services/plugin-host-services.ts), and the underlying query has no
+ * ORDER BY — so rows can move between two requests and paged reads cannot prove
+ * they saw the whole set. Asking for one more than the cap is what tells us the
+ * set is too large to enumerate safely.
+ */
+const COMPANY_SNAPSHOT_CAP = 1000;
+const COMPANY_SNAPSHOT_REQUEST = COMPANY_SNAPSHOT_CAP + 1;
+/** How far into the sorted set ownership selection will probe. */
+const COMPANY_PROBE_LIMIT = 25;
 /** Opportunistic bootstrap attempts are rate-limited; onConfigChanged bypasses this. */
 const BOOTSTRAP_RETRY_COOLDOWN_MS = 60_000;
 let nextOpportunisticBootstrapAt = 0;
@@ -1094,12 +1105,18 @@ async function bootstrapFromScopedConfig(
  * each company's stored config, and adopt the first one that answers with a
  * usable bot token. Works from 2026.817.0, where the host seeds proactive
  * company scopes for companies that already have a config row.
+ *
+ * Probing stops after COMPANY_PROBE_LIMIT companies. That prefix is a true
+ * prefix of the same sorted set the host replays from, so whatever it adopts is
+ * the host's choice too; if the first configured company sits beyond it, the walk
+ * adopts nobody and waits for the delivery rather than binding to the wrong one.
  */
 async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRuntime | null> {
   const companyIds = await listAllCompanyIds(ctx);
   if (!companyIds) return null;
 
-  for (const companyId of companyIds) {
+  const probeSet = companyIds.slice(0, COMPANY_PROBE_LIMIT);
+  for (const companyId of probeSet) {
     // Snapshot before the awaited read: a delivery may adopt a runtime while we
     // are waiting, and this walk's view of the world is then stale.
     const sequenceBefore = runtimeAdoptionSequence;
@@ -1112,6 +1129,13 @@ async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRunt
     }
     if (started) return started;
   }
+
+  if (companyIds.length > probeSet.length) {
+    ctx.logger.info("Startup walk found no configured company within its probe limit; waiting for a delivery", {
+      probed: probeSet.length,
+      companies: companyIds.length,
+    });
+  }
   return null;
 }
 
@@ -1120,47 +1144,47 @@ async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRunt
  * replay is ordered.
  *
  * This ordering is the whole point. From v2026.817.0 the host replays each stored
- * config row to a freshly started worker, and `listConfigs` orders those rows by
- * `companyId` ascending (server/src/services/plugin-registry.ts), so the first
- * row the host replays — the one a single-tenant worker binds to — belongs to the
- * lowest company id that has a configuration. If this walk adopted a different
- * company, the plugin and the host would disagree about who owns the worker, and
- * every later delivery for the host's choice would be refused as cross-tenant.
+ * config row to a freshly started worker (paperclipai/paperclip#10092, commit
+ * 1ebf5254b), and `listConfigs` orders those rows by `companyId` ascending
+ * (server/src/services/plugin-registry.ts), so the first row the host replays —
+ * the one a single-tenant worker binds to — belongs to the lowest company id that
+ * has a configuration. If this walk adopted a different company, the plugin and
+ * the host would disagree about who owns the worker, and every later delivery for
+ * the host's choice would be refused as cross-tenant.
  *
  * Returns null when ownership cannot be selected safely: the caller then waits
  * for the host to deliver a configuration instead of guessing.
  */
 async function listAllCompanyIds(ctx: PluginContext): Promise<string[] | null> {
-  const ids: string[] = [];
-  for (let offset = 0; offset < COMPANY_WALK_HARD_CAP; offset += COMPANY_PAGE_SIZE) {
-    let page: Array<{ id: string }>;
-    try {
-      page = await ctx.companies.list({ limit: COMPANY_PAGE_SIZE, offset });
-    } catch (err) {
-      ctx.logger.info("Could not list companies; waiting for a config delivery", {
-        error: summarizeError(err),
-        offset,
-      });
-      return null;
-    }
-    for (const company of page) {
-      if (company?.id) ids.push(company.id);
-    }
-    // A short page is the end of the list.
-    if (page.length < COMPANY_PAGE_SIZE) {
-      // Byte-order ascending, matching the host's `asc(companyId)`. Explicit
-      // comparator: the default sort is fine for ASCII ids but says nothing
-      // about locale-sensitive collation.
-      return ids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-    }
+  let rows: Array<{ id: string }>;
+  try {
+    // One request, one consistent view. Asking for CAP + 1 makes "too many to
+    // enumerate" detectable without a second, unrelatable query.
+    rows = await ctx.companies.list({ limit: COMPANY_SNAPSHOT_REQUEST, offset: 0 });
+  } catch (err) {
+    ctx.logger.info("Could not list companies; waiting for a config delivery", {
+      error: summarizeError(err),
+    });
+    return null;
   }
 
-  ctx.logger.warn(
-    "Discord plugin found more companies than it will enumerate; skipping startup company selection " +
-      "and waiting for the host to deliver a configuration",
-    { hardCap: COMPANY_WALK_HARD_CAP },
-  );
-  return null;
+  if (rows.length > COMPANY_SNAPSHOT_CAP) {
+    ctx.logger.warn(
+      "Discord plugin sees more companies than it will enumerate; skipping startup company selection " +
+        "and waiting for the host to deliver a configuration",
+      { cap: COMPANY_SNAPSHOT_CAP },
+    );
+    return null;
+  }
+
+  const ids: string[] = [];
+  for (const company of rows) {
+    if (company?.id) ids.push(company.id);
+  }
+  // Byte-order ascending, matching the host's `asc(companyId)`. Explicit
+  // comparator: the default sort is fine for ASCII ids but says nothing about
+  // locale-sensitive collation.
+  return ids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 /**
@@ -1179,6 +1203,8 @@ async function identifyDeliveredCompany(
 ): Promise<string | null> {
   if (runtime) return runtime.companyId;
 
+  // Not limited to the ownership probe prefix: the delivered company can sit
+  // anywhere in the sorted set, and the set is already bounded by the snapshot cap.
   const companyIds = (await listAllCompanyIds(ctx)) ?? [];
   const readable: Array<{ id: string; config: Record<string, unknown> }> = [];
   for (const companyId of companyIds) {
