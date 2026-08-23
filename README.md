@@ -189,6 +189,11 @@ On v2026.720.0 and v2026.722.0 the SDK also delivers configuration without telli
 company it belongs to. The plugin identifies the company itself, by probing the companies it can see
 from inside that delivery, so a multi-company install still binds to the right one.
 
+This plugin is single-tenant: one install serves one company. When several companies have a stored
+configuration, it binds to the same one the host would — the lowest company ID with a configuration,
+which is the first the host replays at startup — and logs the others rather than rebinding. Running
+Discord for a second company needs a second plugin install.
+
 ## Troubleshooting: confirm your Paperclip host
 
 Before filing a bug, confirm which Paperclip host this plugin is actually talking to. Run `paperclipai plugin target` ([#8575](https://github.com/paperclipai/paperclip/pull/8575)) — it prints the resolved API URL plus the server's status, version, deploymentMode, and deploymentExposure *before* anything is installed. A server version older than this plugin expects is the most common cause of activation failures and secret-resolution errors (e.g. `discordBotTokenRef` not resolving) that look like plugin bugs but aren't. If the URL or version is wrong, point Paperclip at the right host — or update the server — before opening an issue.

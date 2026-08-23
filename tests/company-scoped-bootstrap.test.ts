@@ -189,9 +189,14 @@ function buildHost(options: HostOptions = {}) {
     actions: { register: vi.fn() },
     events: { on: vi.fn(), emit: vi.fn(), subscribe: vi.fn() },
     companies: {
-      list: vi.fn(async () => {
+      // Honours limit/offset like the host, so a walk that only reads the first
+      // page is visible as a wrong answer rather than passing by accident.
+      list: vi.fn(async (input?: { limit?: number; offset?: number }) => {
         if (companiesThrow) throw new Error("companies.list is unavailable");
-        return companies.map((id) => ({ id, name: `Company ${id.slice(0, 4)}` }));
+        const all = companies.map((id) => ({ id, name: `Company ${id.slice(0, 4)}` }));
+        if (!input?.limit) return all;
+        const offset = input.offset ?? 0;
+        return all.slice(offset, offset + input.limit);
       }),
     },
     agents: { list: vi.fn(async () => []), invoke: vi.fn() },
@@ -408,6 +413,58 @@ describe("host matrix: >= 2026.817.0 (proactive company scopes)", () => {
     await definition().setup(ctx);
 
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
+  });
+
+  it("adopts the same company the host's startup replay would, across pages", async () => {
+    // From v2026.817.0 the host replays stored config rows to a fresh worker in
+    // `asc(companyId)` order (plugin-registry.listConfigs), and a single-tenant
+    // worker binds to the first row. If this walk adopted a different company,
+    // the plugin and the host would disagree about who owns the worker and every
+    // later delivery for the host's choice would be refused as cross-tenant.
+    // The readable configs here straddle a page boundary, and the one the host
+    // would replay first is on the SECOND page.
+    const many = Array.from({ length: 26 }, (_, i) => `z-company-${String(i).padStart(2, "0")}`);
+    many.push("a-company");
+    const { ctx } = buildHost({
+      companies: many,
+      rows: {
+        "z-company-00": storedConfig(),
+        "a-company": storedConfig(),
+      },
+    });
+
+    await definition().setup(ctx);
+
+    expect(_getRuntimeForTests()?.companyId).toBe("a-company");
+  });
+
+  it("pages through companies until a short page", async () => {
+    const many = Array.from({ length: 250 }, (_, i) => `company-${String(i).padStart(3, "0")}`);
+    const { ctx } = buildHost({ companies: many, rows: { "company-249": storedConfig() } });
+
+    await definition().setup(ctx);
+
+    expect(_getRuntimeForTests()?.companyId).toBe("company-249");
+    const requestedOffsets = ctx.companies.list.mock.calls.map((call: any[]) => call[0]?.offset);
+    expect(requestedOffsets).toEqual([0, 100, 200]);
+  });
+
+  it("skips company selection instead of guessing when the tenant is too large", async () => {
+    // Enumerating an unbounded company list is not worth it; wait for a delivery.
+    const many = Array.from({ length: 1200 }, (_, i) => `company-${String(i).padStart(4, "0")}`);
+    const { ctx } = buildHost({ companies: many, rows: { "company-0000": storedConfig() } });
+
+    await definition().setup(ctx);
+
+    expect(_getRuntimeForTests()).toBeNull();
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("more companies than it will enumerate"),
+      expect.objectContaining({ hardCap: 1000 }),
+    );
+
+    // A delivery still starts it.
+    await definition().onConfigChanged(storedConfig(), { companyId: "company-0000" });
+    expect(_getRuntimeForTests()?.companyId).toBe("company-0000");
   });
 
   it("fresh install: the walk finds nothing, then a config save bootstraps it", async () => {

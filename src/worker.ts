@@ -226,6 +226,15 @@ let bootstrapQueue: Promise<void> = Promise.resolve();
 let bootstrapInFlight: Promise<DiscordRuntime | null> | null = null;
 /** Last host error from a scoped config read, for the degraded-health message. */
 let lastScopedConfigError: string | null = null;
+/**
+ * Bumped every time a runtime is adopted. A walk that awaited a read across an
+ * adoption is working from a stale world and must drop its result.
+ */
+let runtimeAdoptionSequence = 0;
+
+/** Company enumeration for the startup walk. */
+const COMPANY_PAGE_SIZE = 100;
+const COMPANY_WALK_HARD_CAP = 1000;
 /** Opportunistic bootstrap attempts are rate-limited; onConfigChanged bypasses this. */
 const BOOTSTRAP_RETRY_COOLDOWN_MS = 60_000;
 let nextOpportunisticBootstrapAt = 0;
@@ -253,6 +262,7 @@ export function _resetRuntimeForTests(): void {
   bootstrapInFlight = null;
   bootstrapQueue = Promise.resolve();
   lastScopedConfigError = null;
+  runtimeAdoptionSequence = 0;
   nextOpportunisticBootstrapAt = 0;
   seenEvents.clear();
   runtimeHealth = {
@@ -918,6 +928,7 @@ async function bootstrapRuntime(
   }
 
   // Publish before the network work: gateway callbacks read the module runtime.
+  if (runtime !== rt) runtimeAdoptionSequence += 1;
   runtime = rt;
 
   if (defaultGuildId) {
@@ -1079,27 +1090,77 @@ async function bootstrapFromScopedConfig(
 }
 
 /**
- * Best-effort startup walk: list companies, try each company's stored config,
- * first one with a usable bot token wins. Works from 2026.817.0, where the host
- * seeds proactive company scopes for companies that already have a config row.
+ * Best-effort startup walk: enumerate companies in the host's replay order, try
+ * each company's stored config, and adopt the first one that answers with a
+ * usable bot token. Works from 2026.817.0, where the host seeds proactive
+ * company scopes for companies that already have a config row.
  */
 async function bootstrapFromStartupWalk(ctx: PluginContext): Promise<DiscordRuntime | null> {
-  for (const company of await listCompanies(ctx)) {
-    const started = await bootstrapFromScopedConfig(ctx, company.id);
+  const companyIds = await listAllCompanyIds(ctx);
+  if (!companyIds) return null;
+
+  for (const companyId of companyIds) {
+    // Snapshot before the awaited read: a delivery may adopt a runtime while we
+    // are waiting, and this walk's view of the world is then stale.
+    const sequenceBefore = runtimeAdoptionSequence;
+    const started = await bootstrapFromScopedConfig(ctx, companyId);
+    if (runtimeAdoptionSequence !== sequenceBefore && runtime && runtime !== started) {
+      ctx.logger.debug("Startup walk superseded by a configuration delivery; dropping its result", {
+        companyId,
+      });
+      return runtime;
+    }
     if (started) return started;
   }
   return null;
 }
 
-async function listCompanies(ctx: PluginContext): Promise<Array<{ id: string }>> {
-  try {
-    return await ctx.companies.list();
-  } catch (err) {
-    ctx.logger.info("Could not list companies; waiting for a config delivery", {
-      error: summarizeError(err),
-    });
-    return [];
+/**
+ * Every company id the host will show us, ordered the way the host's own startup
+ * replay is ordered.
+ *
+ * This ordering is the whole point. From v2026.817.0 the host replays each stored
+ * config row to a freshly started worker, and `listConfigs` orders those rows by
+ * `companyId` ascending (server/src/services/plugin-registry.ts), so the first
+ * row the host replays — the one a single-tenant worker binds to — belongs to the
+ * lowest company id that has a configuration. If this walk adopted a different
+ * company, the plugin and the host would disagree about who owns the worker, and
+ * every later delivery for the host's choice would be refused as cross-tenant.
+ *
+ * Returns null when ownership cannot be selected safely: the caller then waits
+ * for the host to deliver a configuration instead of guessing.
+ */
+async function listAllCompanyIds(ctx: PluginContext): Promise<string[] | null> {
+  const ids: string[] = [];
+  for (let offset = 0; offset < COMPANY_WALK_HARD_CAP; offset += COMPANY_PAGE_SIZE) {
+    let page: Array<{ id: string }>;
+    try {
+      page = await ctx.companies.list({ limit: COMPANY_PAGE_SIZE, offset });
+    } catch (err) {
+      ctx.logger.info("Could not list companies; waiting for a config delivery", {
+        error: summarizeError(err),
+        offset,
+      });
+      return null;
+    }
+    for (const company of page) {
+      if (company?.id) ids.push(company.id);
+    }
+    // A short page is the end of the list.
+    if (page.length < COMPANY_PAGE_SIZE) {
+      // Byte-order ascending, matching the host's `asc(companyId)`. Explicit
+      // comparator: the default sort is fine for ASCII ids but says nothing
+      // about locale-sensitive collation.
+      return ids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    }
   }
+
+  ctx.logger.warn(
+    "Discord plugin found more companies than it will enumerate; skipping startup company selection " +
+      "and waiting for the host to deliver a configuration",
+    { hardCap: COMPANY_WALK_HARD_CAP },
+  );
+  return null;
 }
 
 /**
@@ -1118,11 +1179,11 @@ async function identifyDeliveredCompany(
 ): Promise<string | null> {
   if (runtime) return runtime.companyId;
 
-  const companies = await listCompanies(ctx);
+  const companyIds = (await listAllCompanyIds(ctx)) ?? [];
   const readable: Array<{ id: string; config: Record<string, unknown> }> = [];
-  for (const company of companies) {
-    const config = await readScopedConfig(ctx, company.id);
-    if (config) readable.push({ id: company.id, config });
+  for (const companyId of companyIds) {
+    const config = await readScopedConfig(ctx, companyId);
+    if (config) readable.push({ id: companyId, config });
   }
 
   if (readable.length === 0) return null;
