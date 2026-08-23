@@ -553,6 +553,12 @@ const plugin = definePlugin({
       {
         listenForMessages: gatewayNeedsMessages,
         includeMessageContent: gatewayNeedsMessages,
+        // Fatal close codes and identify-budget exhaustion stop the gateway
+        // permanently; report it through plugin health instead of running
+        // silently without realtime Discord connectivity.
+        onPermanentFailure: (message, details) => {
+          runtimeHealth = { status: "degraded", message, details };
+        },
       },
     );
 
