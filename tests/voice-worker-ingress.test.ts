@@ -93,6 +93,8 @@ const COMPANY_A = "11111111-1111-1111-1111-111111111111";
 const OTHER_COMPANY = "22222222-2222-2222-2222-222222222222";
 const SECRET_ID = "33333333-3333-3333-3333-333333333333";
 const VOICE_ISSUE = "44444444-4444-4444-4444-444444444444";
+const CHANNEL_ISSUE = "55555555-5555-5555-5555-555555555555";
+const TEXT_CHANNEL = "1490608926423646298";
 
 function storedConfig(overrides: Record<string, unknown> = {}) {
   return {
@@ -141,7 +143,16 @@ function buildHost() {
     companies: { list: vi.fn(async () => [{ id: COMPANY_A, name: "A" }]) },
     agents: { list: vi.fn(async () => []), invoke: vi.fn() },
     issues: { list: vi.fn(async () => []), get: vi.fn(async () => null), listComments: vi.fn(async () => []) },
-    http: { fetch: vi.fn(async () => ({ ok: true, json: async () => ({}), text: async () => "" })) },
+    // Discord REST. A posted embed answers with its message id, which is what
+    // makes notify() write the mappings voice later routes by.
+    http: {
+      fetch: vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "posted-msg-1" }),
+        text: async () => "",
+      })),
+    },
   } as any;
 
   return {
@@ -150,11 +161,36 @@ function buildHost() {
     async deliver(companyId = COMPANY_A, config = storedConfig()) {
       await definition().onConfigChanged(config, { companyId });
     },
+    /** Drive a notification through notify(), which is what refreshes the pointers. */
+    async notifyIssue(companyId: string, entityId: string) {
+      for (const handler of eventHandlers.get("issue.created") ?? []) {
+        await handler({
+          eventId: `evt-${Math.random().toString(36).slice(2)}`,
+          eventType: "issue.created",
+          companyId,
+          entityId,
+          entityType: "issue",
+          occurredAt: new Date().toISOString(),
+          payload: { title: "a new issue", identifier: "T-1" },
+        });
+      }
+    },
   };
 }
 
 function definition(): any {
   return capturedDefinitions[capturedDefinitions.length - 1];
+}
+
+/** One finished utterance, as the voice client hands it over. */
+function utterance(text = "ship the release") {
+  return {
+    userId: "speaker-7",
+    text,
+    durationSec: 1.2,
+    finalizedAt: new Date().toISOString(),
+    threadKey: "voice:guild-1:voice-chan-1:sess-a",
+  };
 }
 
 function gateway(): any {
@@ -178,6 +214,8 @@ function typedMessage(overrides: Record<string, unknown> = {}) {
 }
 
 let fetchMock: ReturnType<typeof vi.fn>;
+let webhookLookup: { ok: boolean; channelId: string };
+let commentPostFails = false;
 
 beforeEach(() => {
   _resetRuntimeForTests();
@@ -185,6 +223,7 @@ beforeEach(() => {
   gatewayConnects.length = 0;
   voiceClients.length = 0;
   voiceModule.startRejectsWith = null;
+  commentPostFails = false;
   vi.clearAllMocks();
 
   process.env.DISCORD_VOICE_GUILD_ID = "guild-1";
@@ -193,13 +232,26 @@ beforeEach(() => {
   process.env.DEEPGRAM_API_KEY = "deepgram-secret";
   delete process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID;
 
-  fetchMock = vi.fn(async () => ({
-    ok: true,
-    status: 200,
-    headers: new Headers(),
-    json: async () => ({}),
-    text: async () => "",
-  })) as any;
+  webhookLookup = { ok: true, channelId: TEXT_CHANNEL };
+  fetchMock = vi.fn(async (url: any) => {
+    if (String(url).includes("/api/webhooks/")) {
+      // Discord's webhook object carries the channel the URL posts into.
+      return {
+        ok: webhookLookup.ok,
+        status: webhookLookup.ok ? 200 : 404,
+        headers: new Headers(),
+        json: async () => ({ id: "1", channel_id: webhookLookup.channelId }),
+        text: async () => "",
+      };
+    }
+    return {
+      ok: !commentPostFails,
+      status: commentPostFails ? 404 : 200,
+      headers: new Headers(),
+      json: async () => ({}),
+      text: async () => (commentPostFails ? "issue not found" : ""),
+    };
+  }) as any;
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -394,6 +446,172 @@ describe("inbound ingress — one path for typed replies and voice (F1)", () => 
     });
 
     expect(commentPosts()).toHaveLength(0);
+  });
+});
+
+describe("voice destination — channel target, then configured default", () => {
+  it("writes a channel voice target every time it posts a notification", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await host.notifyIssue(COMPANY_A, CHANNEL_ISSUE);
+
+    expect(host.stateStore.get(`instance::voice_target_${TEXT_CHANNEL}`)).toMatchObject({
+      entityId: CHANNEL_ISSUE,
+      entityType: "issue",
+      companyId: COMPANY_A,
+    });
+  });
+
+  it("prefers what the transcript's channel is currently about", async () => {
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+    await host.notifyIssue(COMPANY_A, CHANNEL_ISSUE);
+
+    await voiceConfig().ingestUtterance(utterance());
+
+    expect(commentPosts()).toHaveLength(1);
+    expect(String(commentPosts()[0][0])).toContain(`/api/issues/${CHANNEL_ISSUE}/comments`);
+  });
+
+  it("moves with the channel — last notification wins", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await host.notifyIssue(COMPANY_A, CHANNEL_ISSUE);
+    await host.notifyIssue(COMPANY_A, "issue-later");
+    await voiceConfig().ingestUtterance(utterance());
+
+    expect(String(commentPosts()[0][0])).toContain("/api/issues/issue-later/comments");
+  });
+
+  it("falls back to the configured default when the channel has no target", async () => {
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await voiceConfig().ingestUtterance(utterance());
+
+    expect(String(commentPosts()[0][0])).toContain(`/api/issues/${VOICE_ISSUE}/comments`);
+  });
+
+  it("ignores a channel target left by a previous owner of this install", async () => {
+    // Ownership can move (claimOwnership's equal-config rule). A pointer written
+    // under the old owner must never route a transcript under the new one.
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    host.stateStore.set(`instance::voice_target_${TEXT_CHANNEL}`, {
+      entityId: CHANNEL_ISSUE,
+      entityType: "issue",
+      companyId: OTHER_COMPANY,
+    });
+
+    await voiceConfig().ingestUtterance(utterance());
+
+    expect(commentPosts()).toHaveLength(1);
+    expect(String(commentPosts()[0][0])).toContain(`/api/issues/${VOICE_ISSUE}/comments`);
+  });
+
+  it("ingests nothing when the only channel target belongs to another company", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    host.stateStore.set(`instance::voice_target_${TEXT_CHANNEL}`, {
+      entityId: CHANNEL_ISSUE,
+      entityType: "issue",
+      companyId: OTHER_COMPANY,
+    });
+
+    await voiceConfig().ingestUtterance(utterance());
+
+    expect(commentPosts()).toHaveLength(0);
+  });
+
+  it("uses the configured default when the webhook's channel cannot be resolved", async () => {
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+    await host.notifyIssue(COMPANY_A, CHANNEL_ISSUE);
+
+    webhookLookup.ok = false;
+    await voiceConfig().ingestUtterance(utterance());
+
+    expect(String(commentPosts()[0][0])).toContain(`/api/issues/${VOICE_ISSUE}/comments`);
+  });
+
+  it("never puts the webhook URL in the log when its lookup fails", async () => {
+    webhookLookup.ok = false;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+    await voiceConfig().ingestUtterance(utterance());
+
+    const said = JSON.stringify([
+      host.ctx.logger.warn.mock.calls,
+      host.ctx.logger.error.mock.calls,
+      host.ctx.logger.info.mock.calls,
+    ]);
+    expect(said).not.toContain("webhook-secret");
+  });
+
+  it("reports display-only health when nothing is configured, and clears it once routed", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await voiceConfig().ingestUtterance(utterance());
+    let health = await definition().onHealth();
+    expect(health.status).toBe("degraded");
+    expect(health.details).toMatchObject({ issue: "discord-voice-display-only" });
+    expect(health.message).toContain("display-only");
+    expect(health.message).not.toContain("webhook-secret");
+
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    await voiceConfig().ingestUtterance(utterance());
+    health = await definition().onHealth();
+    expect(health.status).toBe("ok");
+  });
+
+  it("survives a destination Paperclip rejects, and says so through health", async () => {
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    commentPostFails = true;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await expect(voiceConfig().ingestUtterance(utterance())).resolves.toBeUndefined();
+
+    const health = await definition().onHealth();
+    expect(health.status).toBe("degraded");
+    expect(health.details).toMatchObject({ issue: "discord-voice-display-only" });
+    expect(health.message).toContain("rejected");
+  });
+
+  it("leaves the typed-reply path on its own message mapping", async () => {
+    // A channel target must not hijack a reply that has a mapping of its own.
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+    await host.notifyIssue(COMPANY_A, CHANNEL_ISSUE);
+
+    host.stateStore.set("instance::msg_chan-1_msg-1", {
+      entityId: "issue-9",
+      entityType: "issue",
+      companyId: COMPANY_A,
+    });
+    await gateway().onMessage(typedMessage());
+
+    expect(String(commentPosts()[0][0])).toContain("/api/issues/issue-9/comments");
   });
 });
 

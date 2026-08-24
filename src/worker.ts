@@ -204,6 +204,17 @@ type DiscordRuntime = {
   listenForMessages: boolean;
   /** Same, for the voice-state intent: voice cannot be added to a live socket. */
   voiceEnabled: boolean;
+  /**
+   * The text channel behind the voice webhook, resolved once and cached.
+   *
+   * A webhook URL does not carry its channel, and the channel is what voice
+   * routes by, so it has to be asked for. Null until the first successful
+   * lookup; a failed lookup simply means voice falls back to the configured
+   * default for that utterance.
+   */
+  voiceTextChannelId: string | null;
+  /** Keeps a persistently failing webhook lookup from logging on every utterance. */
+  voiceWebhookLookupLogged: boolean;
   /** The first-install backfill runs at most once per runtime. */
   backfillStarted: boolean;
   defaultGuildId: string | null;
@@ -598,6 +609,18 @@ async function notify(
           eventType: event.eventType,
         },
       );
+      // And the channel-level pointer voice routes by. A spoken utterance is
+      // not a reply, so it has no message to inherit a destination from; this
+      // gives it "whatever this channel is currently about". Last notification
+      // wins — see `voiceTargetKey` for what that means at the read side.
+      await ctx.state.set(
+        { scopeKind: "instance", stateKey: voiceTargetKey(channelId) },
+        {
+          entityId: event.entityId,
+          entityType: event.entityType,
+          companyId: event.companyId,
+        },
+      );
     }
 
     await ctx.activity.log({
@@ -694,6 +717,26 @@ type InboundDestination = {
   companyId: string;
 };
 
+/**
+ * What became of one piece of inbound text.
+ *
+ * `no-destination` and `rejected` are both "nothing was written to Paperclip",
+ * but they mean different things to an operator: one is a configuration gap,
+ * the other a destination that exists and refused.
+ */
+type InboundOutcome = "routed" | "empty" | "no-destination" | "rejected";
+
+/** State key holding what a text channel is currently about, for voice routing. */
+function voiceTargetKey(channelId: string): string {
+  return `voice_target_${channelId}`;
+}
+
+/** Trim a configured string to null when it carries nothing. */
+function trimToNull(value: string | undefined | null): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
 /** Thread key for a typed reply to a message this plugin posted. */
 function replyThreadKey(channelId: string, messageId: string): string {
   return `reply:${channelId}:${messageId}`;
@@ -710,6 +753,7 @@ async function resolveInboundDestination(
   ctx: PluginContext,
   rt: DiscordRuntime,
   threadKey: string,
+  input: { channelId: string | null },
 ): Promise<InboundDestination | null> {
   if (threadKey.startsWith("reply:")) {
     const [, channelId, messageId] = threadKey.split(":");
@@ -723,10 +767,39 @@ async function resolveInboundDestination(
 
   if (threadKey.startsWith("voice:")) {
     // A spoken utterance is not a reply to anything, so it has no message
-    // mapping to inherit. It goes to the destination the operator configured for
-    // voice, under the company that owns this install — never a company read
-    // from anywhere else (see "Runtime state").
-    const entityId = normalizeDiscordId(process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID);
+    // mapping to inherit. Two destinations, in order.
+    //
+    // First: what the transcript's own channel is currently about — the pointer
+    // `notify()` refreshes every time it posts there.
+    //
+    // KNOWN PHASE-1 PROPERTY: that pointer is last-notification-wins. It follows
+    // the most recent thing the plugin announced in the channel, not the thing
+    // the room is talking about, so a notification arriving mid-conversation
+    // moves where the next utterance lands. Phase 1 accepts this; a real
+    // conversation-scoped target needs state voice does not have yet.
+    if (input.channelId) {
+      const pointer = (await ctx.state.get({
+        scopeKind: "instance",
+        stateKey: voiceTargetKey(input.channelId),
+      })) as InboundDestination | null;
+      // Ownership can move between the write and the read (see `claimOwnership`).
+      // A pointer written for a company this install no longer serves must never
+      // route anything: dropping to the configured default is the safe direction,
+      // commenting under the wrong company is not.
+      if (pointer?.entityId && pointer.companyId === rt.companyId) {
+        return pointer;
+      }
+      if (pointer?.entityId) {
+        ctx.logger.info(
+          "voice: ignoring a channel target left by a previous owner of this install",
+          { runningCompanyId: rt.companyId, pointerCompanyId: pointer.companyId },
+        );
+      }
+    }
+
+    // Then: the destination the operator configured, under the company that owns
+    // this install — never a company read from anywhere else (see "Runtime state").
+    const entityId = trimToNull(process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID);
     if (!entityId) return null;
     return { entityId, entityType: "issue", companyId: rt.companyId };
   }
@@ -751,7 +824,7 @@ async function ingestInbound(
   ctx: PluginContext,
   rt: DiscordRuntime,
   input: {
-    channelId: string;
+    channelId: string | null;
     /** Attributed author, in the `discord:...` form Paperclip stores. */
     author: string;
     /**
@@ -763,12 +836,12 @@ async function ingestInbound(
     text: string;
     threadKey: string;
   },
-): Promise<void> {
+): Promise<InboundOutcome> {
   const text = input.text.trim();
-  if (!text) return;
+  if (!text) return "empty";
 
-  const mapping = await resolveInboundDestination(ctx, rt, input.threadKey);
-  if (!mapping) return;
+  const mapping = await resolveInboundDestination(ctx, rt, input.threadKey, input);
+  if (!mapping) return "no-destination";
 
   if (mapping.entityType === "escalation") {
     // Route to escalation response
@@ -811,7 +884,10 @@ async function ingestInbound(
       from: input.author,
       threadKey: input.threadKey,
     });
-  } else if (mapping.entityType === "issue") {
+    return "routed";
+  }
+
+  if (mapping.entityType === "issue") {
     // Route to issue comment
     try {
       await paperclipFetch(
@@ -832,10 +908,21 @@ async function ingestInbound(
         from: input.author,
         threadKey: input.threadKey,
       });
+      return "routed";
     } catch (err) {
-      ctx.logger.error("Failed to route inbound message", { error: String(err) });
+      // A destination that Paperclip rejects — the issue was deleted, it belongs
+      // to another company — must not take the pipeline down with it. The text
+      // is lost for this utterance and the transcript still shows in the channel.
+      ctx.logger.error("Failed to route inbound message", {
+        entityId: mapping.entityId,
+        threadKey: input.threadKey,
+        error: summarizeError(err, [rt.paperclipBoardApiKey]),
+      });
+      return "rejected";
     }
   }
+
+  return "no-destination";
 }
 
 /**
@@ -1141,6 +1228,8 @@ async function bootstrapRuntime(
   rt.digestMode = config.digestMode ?? "off";
   rt.listenForMessages = listenForMessages;
   rt.voiceEnabled = voiceEnabled;
+  rt.voiceTextChannelId = rt.voiceTextChannelId ?? null;
+  rt.voiceWebhookLookupLogged = rt.voiceWebhookLookupLogged ?? false;
   rt.voiceStop = rt.voiceStop ?? null;
 
   if (!reuseGateway) {
@@ -1247,8 +1336,75 @@ async function bootstrapRuntime(
   return rt;
 }
 
+/**
+ * The text channel a voice webhook posts into.
+ *
+ * Discord's webhook object carries `channel_id`; the URL does not. Voice needs
+ * it to find what that channel is currently about, so it is fetched once and
+ * cached on the runtime. Every failure path returns null, which costs nothing
+ * worse than falling back to the configured default destination.
+ *
+ * The URL is a credential — it authorizes posting to the channel — so it is
+ * never logged, not even on failure.
+ */
+async function resolveVoiceTextChannelId(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  webhookUrl: string,
+): Promise<string | null> {
+  if (rt.voiceTextChannelId) return rt.voiceTextChannelId;
+  try {
+    const response = await fetch(webhookUrl, { method: "GET" });
+    if (!response.ok) throw new Error(`webhook lookup returned ${response.status}`);
+    const webhook = (await response.json()) as { channel_id?: unknown };
+    const channelId = normalizeDiscordId(webhook.channel_id);
+    if (!channelId) throw new Error("webhook carries no channel id");
+    rt.voiceTextChannelId = channelId;
+    return channelId;
+  } catch (err) {
+    if (!rt.voiceWebhookLookupLogged) {
+      rt.voiceWebhookLookupLogged = true;
+      ctx.logger.warn(
+        "voice: could not resolve the transcript channel from its webhook; " +
+          "utterances will use the configured default destination",
+        { error: summarizeError(err, [webhookUrl]) },
+      );
+    }
+    return null;
+  }
+}
+
+/**
+ * Surface what happened to a spoken utterance through plugin health.
+ *
+ * An operator who wired voice expects what is said in the channel to reach
+ * Paperclip. When it does not, "ok" is the wrong answer — but so is a hard
+ * failure: the transcript still posts, the room still has its record, and text
+ * routing is untouched. Degraded, with a value-free note, is the honest state.
+ */
+function reportVoiceIngestOutcome(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  outcome: InboundOutcome,
+): void {
+  if (outcome === "routed") {
+    clearVoiceDegradedHealth();
+    return;
+  }
+  if (outcome === "empty") return;
+
+  const message =
+    outcome === "no-destination"
+      ? `[${PLUGIN_ID}] voice transcripts display-only: no destination configured`
+      : `[${PLUGIN_ID}] voice transcripts display-only: the destination rejected the comment`;
+  degradeHealth(message, VOICE_DISPLAY_ONLY_ISSUE, { companyId: rt.companyId });
+  ctx.logger.info("voice: transcript posted to the channel but not ingested", { outcome });
+}
+
 /** Health issue code for a configured-but-unavailable voice subsystem. */
 const VOICE_UNAVAILABLE_ISSUE = "discord-voice-unavailable";
+/** Health issue code for voice that runs but has nowhere to send what it hears. */
+const VOICE_DISPLAY_ONLY_ISSUE = "discord-voice-display-only";
 
 /**
  * Clear a voice-unavailable degradation once voice comes up.
@@ -1259,7 +1415,9 @@ const VOICE_UNAVAILABLE_ISSUE = "discord-voice-unavailable";
 function clearVoiceDegradedHealth(): void {
   if (runtimeHealth.status === "ok") return;
   const issue = (runtimeHealth.details as { issue?: unknown } | undefined)?.issue;
-  if (issue === VOICE_UNAVAILABLE_ISSUE) setRuntimeHealth({ status: "ok" });
+  if (issue === VOICE_UNAVAILABLE_ISSUE || issue === VOICE_DISPLAY_ONLY_ISSUE) {
+    setRuntimeHealth({ status: "ok" });
+  }
 }
 
 /**
@@ -1314,13 +1472,17 @@ async function startVoiceIfConfigured(
       ingestUtterance: async (utterance) => {
         const current = runtime;
         if (!current) return;
-        await ingestInbound(ctx, current, {
-          channelId: voiceEnv.voiceChannelId,
+        // The channel voice routes by is the one the transcript appears in, not
+        // the voice channel it was spoken in: that is where notifications land,
+        // and so it is the only one that has a target to inherit.
+        const ingested = await ingestInbound(ctx, current, {
+          channelId: await resolveVoiceTextChannelId(ctx, current, voiceEnv.webhookUrl),
           author: `discord:voice:${utterance.userId}`,
           authorLabel: `voice:${utterance.userId}`,
           text: utterance.text,
           threadKey: utterance.threadKey,
         });
+        reportVoiceIngestOutcome(ctx, current, ingested);
       },
       onAvailabilityChange: (available, reason) => {
         if (available) {

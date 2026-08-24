@@ -154,7 +154,7 @@ This is that plugin.
 
 ### Voice transcription (optional, opt-in)
 - The bot joins one voice channel and transcribes what is said there (inbound only — it never speaks)
-- Each utterance goes to Paperclip through the same inbound ingress a typed reply uses, and is also posted into a text channel by webhook so the room can see what was heard
+- Each utterance goes to Paperclip through the same inbound ingress a typed reply uses — routed to whatever its channel is currently about, or to a configured default — and is also posted into a text channel by webhook so the room can see what was heard
 - The webhook post is **display only** — nothing reads it back, so a transcript cannot loop and no webhook is ever a trusted input source
 - Speech-to-text via Deepgram; end-of-utterance is 800 ms of silence
 - Off unless four environment variables are set, and it rides the plugin's existing gateway connection — no second Discord connection
@@ -255,18 +255,42 @@ Then set these environment variables on the plugin worker:
 | `DISCORD_VOICE_WEBHOOK_URL` | Yes | Webhook URL of the text channel transcripts are posted to |
 | `DEEPGRAM_API_KEY` | Yes | Deepgram API key for streaming speech-to-text |
 | `DISCORD_VOICE_USERNAME` | No | Webhook display name for transcripts (default: `Voice`) |
-| `DISCORD_VOICE_DEFAULT_ISSUE_ID` | No | Paperclip issue that spoken utterances are commented on. Without it, transcripts are posted to the channel but nothing is sent to Paperclip. |
+| `DISCORD_VOICE_DEFAULT_ISSUE_ID` | No | Fallback Paperclip issue for spoken utterances, used when the transcript channel has no target of its own. |
 
 If any of the four required variables is missing, voice initializes nothing and the plugin runs exactly as before. Voice startup and shutdown are both wrapped: a voice failure is logged, reported through plugin health, and never crashes the plugin or interrupts text routing.
 
 ### Where a spoken utterance goes
 
 A voice utterance is not a reply to anything, so it has no message to inherit a
-destination from. It is commented on the issue named by
-`DISCORD_VOICE_DEFAULT_ISSUE_ID`, under the company that owns this install, by
-the same ingress and the same API call a typed reply uses. With that variable
-unset, voice still transcribes and still posts to the text channel — it simply
-sends nothing to Paperclip.
+destination from. Two destinations are tried, in order:
+
+1. **What the transcript's channel is currently about.** Every time the plugin
+   posts a notification into a channel it records what that notification was
+   about, and a spoken utterance follows that pointer.
+2. **`DISCORD_VOICE_DEFAULT_ISSUE_ID`**, when the channel has no pointer yet.
+
+Either way the utterance is commented on the resolved issue under the company
+that owns this install, through the same ingress and the same API call a typed
+reply uses, authored `discord:voice:<userId>`.
+
+With neither available — no notification has been posted in that channel and no
+default configured — voice runs **display-only**: it still transcribes and still
+posts to the text channel, but sends nothing to Paperclip, and plugin health
+says so. The same is true for an utterance whose destination Paperclip rejects
+(the issue was deleted, say): the transcript still shows, health reports it, and
+nothing else in the plugin is affected.
+
+**Known phase-1 property:** the channel pointer is *last-notification-wins*. It
+follows the most recent thing the plugin announced in that channel, not what the
+room is actually discussing, so a notification arriving mid-conversation moves
+where the next utterance lands. Set `DISCORD_VOICE_DEFAULT_ISSUE_ID` and use a
+channel the plugin does not post into if you want a fixed destination. A
+genuinely conversation-scoped target needs state voice does not have yet.
+
+A pointer is only ever followed for the company that currently owns the install.
+Ownership can move between installs, and a pointer left behind by a previous
+owner is ignored rather than allowed to file a transcript under the wrong
+company.
 
 The webhook transcript is never the transport. The inbound router refuses bot
 authors and refuses anything that is not a reply to a message this plugin
