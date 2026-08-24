@@ -3,7 +3,7 @@ export const PLUGIN_ID = "paperclip-plugin-discord";
 // `npm version <x.y.z>` rewrites this line automatically via the `version`
 // lifecycle script (scripts/sync-plugin-version.mjs); tests/manifest-contract.test.ts
 // fails the build if the two ever drift again (issue #74).
-export const PLUGIN_VERSION = "0.9.2";
+export const PLUGIN_VERSION = "0.10.0";
 
 export const WEBHOOK_KEYS = {
   discordInteractions: "discord-interactions",
