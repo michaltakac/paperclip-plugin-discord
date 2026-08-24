@@ -541,35 +541,62 @@ describe("host matrix: >= 2026.817.0 (host replays stored configuration)", () =>
     expect(_getRuntimeForTests()?.defaultChannelId).toBe("1490610083728588950");
   });
 
-  it("bootstraps from a company-scoped invocation when no delivery has arrived", async () => {
-    // Second bootstrap source: an event carries a company scope, which is the one
-    // company this invocation may read.
+  it("does not bootstrap from an invocation: only a delivery starts the runtime", async () => {
+    // An invocation cannot establish ownership the host agrees with: `config.get`
+    // does not move the SDK's recorded company, and on a fresh install probing
+    // would adopt an empty `{}` row while the SDK's owner stays null.
     const host = buildHost({ companies: [COMPANY_A], enforceInvocationScope: true });
     await definition().setup(host.ctx);
-    expect(_getRuntimeForTests()).toBeNull();
 
     await host.emitEvent("issue.created", COMPANY_A);
 
+    expect(_getRuntimeForTests()).toBeNull();
+    expect(host.ctx.config.get).not.toHaveBeenCalled();
+    expect(host.ctx.secrets.resolve).not.toHaveBeenCalled();
+    expect((await definition().onHealth()).status).toBe("degraded");
+
+    // The delivery is what starts it.
+    await host.deliver(COMPANY_A, storedConfig());
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
     expect(await definition().onHealth()).toEqual({ status: "ok" });
   });
 
-  it("refuses a non-owner invocation without reading, degrading, or burning the retry slot", async () => {
-    // Owner A exists but cannot start (its secret no longer resolves). A company-B
-    // event must be terminal BEFORE any retry state or read: probing A under B's
-    // invocation is denied by the host, which would replace A's useful health
-    // reason with a scope denial and consume the retry window A's own next
-    // invocation needs.
+  it("never lets a foreign invocation join a delivery already in flight", async () => {
+    // On an ownerless worker, a B invocation must not ride along on A's pending
+    // bootstrap and act with A's runtime once it resolves. Observed where it
+    // matters: whether anything is sent to Discord for B.
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
+
+    host.deferSecretResolution();
+    const delivery = host.deliver(COMPANY_A, storedConfig({ notifyOnIssueCreated: true }));
+    const inFlightEvent = host.emitEvent("issue.created", COMPANY_B);
+
+    host.releaseSecretResolution();
+    await Promise.all([delivery, inFlightEvent]);
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    const discordCalls = host.ctx.http.fetch.mock.calls.filter(
+      (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
+    );
+    expect(discordCalls).toHaveLength(0);
+
+    // And afterwards, with A live, B is still refused.
+    host.ctx.http.fetch.mockClear();
+    await host.emitEvent("issue.created", COMPANY_B);
+    expect(
+      host.ctx.http.fetch.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("refuses a non-owner invocation without reading or changing health", async () => {
     const host = buildHost({
       companies: [COMPANY_A, COMPANY_B],
-      rows: {
-        [COMPANY_A]: storedConfig(),
-        [COMPANY_B]: storedConfig(),
-      },
       enforceInvocationScope: true,
     });
     await definition().setup(host.ctx);
-
     await host.deliver(COMPANY_A, storedConfig({ discordBotTokenRef: "" }));
     expect(_getRuntimeForTests()).toBeNull();
     const healthAfterOwnerFailure = await definition().onHealth();
@@ -578,7 +605,6 @@ describe("host matrix: >= 2026.817.0 (host replays stored configuration)", () =>
     host.ctx.config.get.mockClear();
     await host.emitEvent("issue.created", COMPANY_B);
 
-    // No read, no health change, and no cooldown consumed.
     expect(host.ctx.config.get).not.toHaveBeenCalled();
     expect(await definition().onHealth()).toEqual(healthAfterOwnerFailure);
     expect(host.ctx.logger.warn).toHaveBeenCalledWith(
@@ -586,66 +612,9 @@ describe("host matrix: >= 2026.817.0 (host replays stored configuration)", () =>
       expect.objectContaining({ invokingCompanyId: COMPANY_B }),
     );
 
-    // The owner's own invocation, immediately after, still re-probes A.
-    await host.emitEvent("issue.created", COMPANY_A);
-    expect(host.ctx.config.get).toHaveBeenCalledWith(COMPANY_A);
+    // The owner recovers on its next valid delivery, not on an invocation.
+    await host.deliver(COMPANY_A, storedConfig());
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
-  });
-
-  it("refuses a non-owner invocation even while the owner's runtime is live", async () => {
-    // A is running. A company-B event must not be served A's runtime: it would
-    // post B's activity into A's Discord, with A's bot token and A's channel.
-    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
-    await definition().setup(host.ctx);
-    await host.deliver(COMPANY_A, storedConfig({ notifyOnIssueCreated: true }));
-    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
-
-    host.ctx.http.fetch.mockClear();
-    host.ctx.logger.warn.mockClear();
-    await host.emitEvent("issue.created", COMPANY_B);
-
-    const discordCalls = host.ctx.http.fetch.mock.calls.filter(
-      (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
-    );
-    expect(discordCalls).toHaveLength(0);
-    expect(host.ctx.logger.warn).toHaveBeenCalledTimes(1);
-    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining(`this install serves ${COMPANY_A}`),
-      expect.objectContaining({ invokingCompanyId: COMPANY_B }),
-    );
-
-    // The owner's own events still post.
-    host.ctx.http.fetch.mockClear();
-    await host.emitEvent("issue.created", COMPANY_A);
-    expect(
-      host.ctx.http.fetch.mock.calls.filter(
-        (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
-      ).length,
-    ).toBeGreaterThan(0);
-  });
-
-  it("retires the previous owner before an equal-config advance can fail", async () => {
-    // The equal-config advance moves ownership to B before any B-scoped work. If
-    // B's secret cannot resolve — the duplicate-row case, where only A has the
-    // secret binding — A must already be retired: leaving A's gateway live under
-    // owner B is a connection nobody owns.
-    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
-    await definition().setup(host.ctx);
-
-    const duplicated = storedConfig();
-    await host.deliver(COMPANY_A, duplicated);
-    expect(liveGateways()).toHaveLength(1);
-
-    host.ctx.secrets.resolve.mockRejectedValue(
-      new Error("Secret binding not found for company"),
-    );
-    await host.deliver(COMPANY_B, { ...duplicated });
-
-    expect(liveGateways()).toHaveLength(0);
-    expect(_getRuntimeForTests()).toBeNull();
-    const diagnostics = await definition().onHealth();
-    expect(diagnostics.status).toBe("degraded");
-    expect(diagnostics.details).toMatchObject({ companyId: COMPANY_B });
   });
 
   it("recovers the owner on its next valid save after a failed bootstrap", async () => {
@@ -847,6 +816,54 @@ describe("re-bootstrap on configuration changes", () => {
       expect.stringContaining(`this install serves ${COMPANY_A}`),
       expect.objectContaining({ runningCompanyId: COMPANY_A, deliveredCompanyId: COMPANY_B }),
     );
+  });
+});
+
+describe("host-authoritative company scoping", () => {
+  it("ignores a caller-supplied companyId in escalate_to_human", async () => {
+    // The dispatcher forwards tool parameters unchanged and supplies the
+    // authenticated company separately, so a `companyId` argument is an
+    // unauthenticated claim. Owner is B; company A invokes the tool claiming B.
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_B, storedConfig({ enableEscalations: true }));
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
+
+    const escalate = host.ctx.tools.register.mock.calls.find(
+      (call: any[]) => call[0] === "escalate_to_human",
+    )![2];
+    const result = await escalate(
+      { companyId: COMPANY_B, agentName: "agent", reason: "why" },
+      { companyId: COMPANY_A },
+    );
+
+    expect(result.error).toBeDefined();
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(`this install serves ${COMPANY_B}`),
+      expect.objectContaining({ invokingCompanyId: COMPANY_A }),
+    );
+  });
+
+  it("runs jobs against the owner's data, not a stale instance default", async () => {
+    // `resolveCompanyId` reads an instance-level default that has nothing to do
+    // with ownership. Pairing its company's data with the owner's Discord
+    // connection is how one company's budgets got posted with another's token.
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_B, storedConfig());
+
+    // A stale instance default pointing at the other company.
+    await host.ctx.state.set({ scopeKind: "instance", stateKey: "company_default" }, {
+      companyId: COMPANY_A,
+    });
+
+    const budgetJob = host.ctx.jobs.register.mock.calls.find(
+      (call: any[]) => call[0] === "check-budget-thresholds",
+    )![1];
+    await budgetJob();
+
+    expect(host.ctx.agents.list).toHaveBeenCalledWith({ companyId: COMPANY_B });
+    expect(host.ctx.agents.list).not.toHaveBeenCalledWith({ companyId: COMPANY_A });
   });
 });
 

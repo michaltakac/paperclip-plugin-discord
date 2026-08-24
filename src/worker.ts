@@ -56,7 +56,6 @@ import {
   type DiscordSecretRef,
 } from "./runtime-token.js";
 
-import { resolveCompanyId } from "./company-resolver.js";
 import {
   type EscalationRecord,
   getEscalation,
@@ -161,18 +160,23 @@ const RUNTIME_NOT_READY_MESSAGE =
 // starts: an unscoped `ctx.config.get()` in setup() throws and kills activation.
 //
 // setup() therefore only registers handlers. Everything that needs config or a
-// secret lives in this runtime, and there are exactly TWO ways it starts:
-//   1. `onConfigChanged` — the host delivers stored config with its scope. From
-//      v2026.817.0 the host replays stored configuration at worker start
-//      (paperclipai/paperclip#10092), and a save arrives this way on every host;
-//   2. the first company-scoped invocation (event, job, tool, action), which
-//      probes THAT invocation's own company — the only one it may read.
+// secret lives in this runtime, and `onConfigChanged` is the ONLY thing that
+// starts it: the host delivers stored configuration with its company scope —
+// replayed at worker start from v2026.817.0 (paperclipai/paperclip#10092), and
+// on every save on every host.
 //
-// The plugin does not go looking for an owner. Ownership follows the host: the
-// first company whose configuration arrives owns this install, and any other
-// company is logged and refused — except for the host's own equal-config rule,
-// mirrored in `claimOwnership`. `multiCompanyConfig` stays unset, so the host
-// also fails a second company's config closed rather than rebinding this worker.
+// An invocation never bootstraps. It cannot establish ownership the host would
+// agree with: `config.get` does not move the SDK's recorded company, so a
+// runtime adopted from an invocation would own an install the SDK still
+// considers unowned, and on a fresh install it would adopt an empty `{}` row
+// while the SDK's owner stayed null. Invocations only ever read the runtime a
+// delivery already established.
+//
+// Ownership follows the host: the first company whose configuration arrives owns
+// this install, and any other company is logged and refused — except for the
+// host's own equal-config rule, mirrored in `claimOwnership`.
+// `multiCompanyConfig` stays unset, so the host also fails a second company's
+// config closed rather than rebinding this worker.
 
 type DiscordRuntime = {
   companyId: string;
@@ -223,8 +227,6 @@ let runtimeHealth: DiscordRuntimeHealth = {
  * and opportunistic bootstraps must queue against each other here.
  */
 let bootstrapQueue: Promise<void> = Promise.resolve();
-/** In-flight opportunistic bootstrap, so concurrent invocations do not pile up. */
-let bootstrapInFlight: Promise<DiscordRuntime | null> | null = null;
 /** Last host error from a scoped config read, for the degraded-health message. */
 let lastScopedConfigError: string | null = null;
 /**
@@ -246,9 +248,6 @@ let ownerCompanyId: string | null = null;
 let ownerConfigJson: string | null = null;
 /** Companies already refused; keeps a chatty non-owner from flooding the log. */
 const refusedCompanies = new Set<string>();
-/** Opportunistic bootstrap attempts are rate-limited; onConfigChanged bypasses this. */
-const BOOTSTRAP_RETRY_COOLDOWN_MS = 60_000;
-let nextOpportunisticBootstrapAt = 0;
 
 /** Event de-duplication window shared by every notification handler. */
 const DEDUP_TTL_MS = 5 * 60 * 1000;
@@ -270,13 +269,11 @@ function degradeHealth(message: string, issue: string, details?: Record<string, 
 export function _resetRuntimeForTests(): void {
   runtime = null;
   _pluginCtx = null;
-  bootstrapInFlight = null;
   bootstrapQueue = Promise.resolve();
   lastScopedConfigError = null;
   ownerCompanyId = null;
   ownerConfigJson = null;
   refusedCompanies.clear();
-  nextOpportunisticBootstrapAt = 0;
   seenEvents.clear();
   runtimeHealth = {
     status: "degraded",
@@ -1128,7 +1125,7 @@ function startBackfillIfEnabled(ctx: PluginContext, rt: DiscordRuntime): void {
   if (rt.backfillStarted) return;
   rt.backfillStarted = true;
   void (async () => {
-    const cid = await resolveCompanyId(ctx);
+    const cid = rt.companyId;
     const existing = await ctx.state.get({
       scopeKind: "company",
       scopeId: cid,
@@ -1170,25 +1167,6 @@ async function readScopedConfig(
     });
     return null;
   }
-}
-
-/** Read one company's stored config with an explicit scope, then bootstrap from it. */
-async function bootstrapFromScopedConfig(
-  ctx: PluginContext,
-  companyId: string,
-): Promise<DiscordRuntime | null> {
-  const rawConfig = await readScopedConfig(ctx, companyId);
-  if (!rawConfig) {
-    degradeHealth(
-      `Company-scoped configuration is not readable yet (${lastScopedConfigError ?? "no configuration delivered"}). ` +
-        "Save the plugin configuration to activate the runtime.",
-      "discord-scoped-config-denied",
-      { companyId },
-    );
-    return null;
-  }
-  if (Object.keys(rawConfig).length === 0) return null;
-  return bootstrapRuntime(ctx, companyId, rawConfig);
 }
 
 /**
@@ -1258,23 +1236,24 @@ function queueBootstrap<T>(work: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Return the running runtime, bootstrapping it opportunistically when a
- * company-scoped invocation gives us a scope to read config with.
+ * The runtime for a company-scoped invocation, or null.
+ *
+ * This never reads configuration and never bootstraps. Configuration deliveries
+ * are the ONLY way a runtime starts (see "Runtime state"): an invocation cannot
+ * establish ownership that agrees with the host, because `config.get` does not
+ * move the SDK's recorded company. A runtime adopted from an invocation would
+ * own an install the SDK still considers unowned, and on a fresh install it
+ * would adopt an empty `{}` row while the SDK's owner stayed null.
+ *
+ * A company that is not the owner gets null, logged once. Callers must treat
+ * null as "do nothing for this company".
  */
 async function ensureRuntime(
   ctx: PluginContext | null,
   companyId?: string | null,
 ): Promise<DiscordRuntime | null> {
-  const pluginCtx = ctx ?? _pluginCtx;
-
-  // A non-owner invocation is terminal, and it is refused BEFORE any runtime is
-  // handed back — a live runtime for the owner must never serve another
-  // company's invocation, or that company's activity is posted into the owner's
-  // Discord with the owner's bot token. It is refused before any retry state or
-  // read too: on 2026.720/722 the host denies a read for any company other than
-  // this invocation's, which would replace the owner's useful health reason with
-  // a scope denial and burn the retry window the owner's next invocation needs.
-  if (ownerCompanyId && companyId && companyId !== ownerCompanyId) {
+  if (companyId && ownerCompanyId && companyId !== ownerCompanyId) {
+    const pluginCtx = ctx ?? _pluginCtx;
     if (pluginCtx && !refusedCompanies.has(companyId)) {
       refusedCompanies.add(companyId);
       pluginCtx.logger.warn(
@@ -1285,31 +1264,11 @@ async function ensureRuntime(
     return null;
   }
 
-  if (runtime) return runtime;
-  if (!pluginCtx) return null;
-
-  // Only this invocation's own company can be read, so that is the only company
-  // worth probing. There is no company walk: ownership follows the host.
-  const target = companyId ?? ownerCompanyId;
-  if (!target) return null;
-
-  if (bootstrapInFlight) return bootstrapInFlight;
-  if (Date.now() < nextOpportunisticBootstrapAt) return null;
-  nextOpportunisticBootstrapAt = Date.now() + BOOTSTRAP_RETRY_COOLDOWN_MS;
-
-  bootstrapInFlight = queueBootstrap(async () => {
-    try {
-      if (runtime) return runtime;
-      return await bootstrapFromScopedConfig(pluginCtx, target);
-    } catch (err) {
-      pluginCtx.logger.warn("Discord plugin bootstrap attempt failed", { error: summarizeError(err) });
-      return null;
-    } finally {
-      bootstrapInFlight = null;
-    }
-  });
-
-  return bootstrapInFlight;
+  // No runtime means no configuration has been delivered yet: there is nothing
+  // to serve, and nothing this invocation may safely adopt.
+  if (!runtime) return null;
+  if (companyId && companyId !== runtime.companyId) return null;
+  return runtime;
 }
 
 const plugin = definePlugin({
@@ -1536,7 +1495,7 @@ const plugin = definePlugin({
         parametersSchema: {
           type: "object",
           properties: {
-            companyId: { type: "string", description: "Company ID" },
+            companyId: { type: "string", description: "Ignored: the host-authenticated company of the invocation is always used" },
             agentName: { type: "string", description: "Agent name" },
             reason: { type: "string", description: "Why escalating" },
             confidenceScore: { type: "number", description: "Confidence (0-1)" },
@@ -1554,7 +1513,10 @@ const plugin = definePlugin({
       async (params, runCtx) => {
         const p = params as Record<string, unknown>;
         const escalationId = `esc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        const escalationCompanyId = String(p.companyId || runCtx.companyId);
+        // The company comes from the host-authenticated run context, never from
+        // caller-supplied parameters: the dispatcher forwards tool parameters
+        // unchanged, so a `companyId` argument is an unauthenticated claim.
+        const escalationCompanyId = runCtx.companyId;
 
         const rt = await ensureRuntime(ctx, escalationCompanyId);
         if (!rt) return { error: RUNTIME_NOT_READY_MESSAGE };
@@ -1701,13 +1663,13 @@ const plugin = definePlugin({
     // ===================================================================
 
     ctx.jobs.register("check-escalation-timeouts", async () => {
-      const jobCompanyId = await resolveCompanyId(ctx);
-      // Jobs are not company-scoped invocations: `resolveCompanyId` picks a
-      // company for state scoping, which need not be the owner. Ask for the
-      // owner's runtime rather than passing that company through the
-      // ownership gate, which would silently disable every job.
       const rt = await ensureRuntime(ctx);
       if (!rt) return;
+      // Jobs are not company-scoped invocations. The company they operate on is
+      // the owner's — the only company this install serves — never whatever
+      // `resolveCompanyId` happens to pick, which would pair one company's data
+      // with another company's Discord connection.
+      const jobCompanyId = rt.companyId;
       const pendingIds = await collectPendingEscalationIds(ctx, jobCompanyId);
       if (pendingIds.length === 0) return;
 
@@ -1759,9 +1721,9 @@ const plugin = definePlugin({
     // ===================================================================
 
     ctx.jobs.register("check-budget-thresholds", async () => {
-      const jobCompanyId = await resolveCompanyId(ctx);
       const rt = await ensureRuntime(ctx);
       if (!rt) return;
+      const jobCompanyId = rt.companyId;
       const agents = await ctx.agents.list({ companyId: jobCompanyId });
 
       for (const agent of agents) {
@@ -1836,7 +1798,7 @@ const plugin = definePlugin({
         parametersSchema: {
           type: "object",
           properties: {
-            companyId: { type: "string", description: "Company ID" },
+            companyId: { type: "string", description: "Ignored: the host-authenticated company of the invocation is always used" },
             command: { type: "string", description: "Command name (without !)" },
             description: { type: "string", description: "Description" },
             parameters: {
@@ -1857,7 +1819,7 @@ const plugin = definePlugin({
         const p = params as Record<string, unknown>;
         const result = await registerCommand(
           ctx,
-          String(p.companyId || runCtx.companyId),
+          runCtx.companyId,
           String(p.command),
           String(p.description),
           (p.parameters as Array<{ name: string; description: string; required: boolean }>) ?? [],
@@ -1880,7 +1842,7 @@ const plugin = definePlugin({
         parametersSchema: {
           type: "object",
           properties: {
-            companyId: { type: "string", description: "Company ID" },
+            companyId: { type: "string", description: "Ignored: the host-authenticated company of the invocation is always used" },
             watchName: { type: "string", description: "Watch name" },
             patterns: { type: "array", items: { type: "string" }, description: "Regex patterns" },
             channelIds: { type: "array", items: { type: "string" }, description: "Channel IDs (empty = all)" },
@@ -1899,7 +1861,7 @@ const plugin = definePlugin({
         const p = params as Record<string, unknown>;
         const result = await registerWatch(
           ctx,
-          String(p.companyId || runCtx.companyId),
+          runCtx.companyId,
           String(p.watchName),
           (p.patterns as string[]) ?? [],
           (p.channelIds as string[]) ?? [],
@@ -1913,9 +1875,9 @@ const plugin = definePlugin({
     );
 
     ctx.jobs.register("check-watches", async () => {
-      const cid = await resolveCompanyId(ctx);
       const rt = await ensureRuntime(ctx);
       if (!rt) return;
+      const cid = rt.companyId;
       if (rt.config.enableProactiveSuggestions === false) {
         ctx.logger.debug("check-watches: proactive suggestions disabled, skipping");
         return;
@@ -2118,7 +2080,7 @@ const plugin = definePlugin({
         parametersSchema: {
           type: "object",
           properties: {
-            companyId: { type: "string", description: "Company ID" },
+            companyId: { type: "string", description: "Ignored: the host-authenticated company of the invocation is always used" },
             category: {
               type: "string",
               enum: ["feature_wish", "pain_point", "maintainer_directive", "sentiment"],
@@ -2130,7 +2092,7 @@ const plugin = definePlugin({
       },
       async (params, runCtx) => {
         const p = params as Record<string, unknown>;
-        const cid = String(p.companyId || runCtx.companyId);
+        const cid = runCtx.companyId;
         const raw = await ctx.state.get({
           scopeKind: "company",
           scopeId: cid,
@@ -2151,9 +2113,9 @@ const plugin = definePlugin({
     // --- Intelligence: scheduled scan ---
 
     ctx.jobs.register("discord-intelligence-scan", async () => {
-      const cid = await resolveCompanyId(ctx);
       const rt = await ensureRuntime(ctx);
       if (!rt) return;
+      const cid = rt.companyId;
       if (!rt.config.enableIntelligence || rt.intelligenceChannelIds.length === 0 || !rt.defaultGuildId) {
         ctx.logger.debug("discord-intelligence-scan: intelligence disabled or no channels configured, skipping");
         return;
@@ -2175,10 +2137,12 @@ const plugin = definePlugin({
     // unconditionally, because whether intelligence is enabled is only known once
     // the runtime exists.
 
-    ctx.actions.register("trigger-backfill", async () => {
-      const cid = await resolveCompanyId(ctx);
-      const rt = await ensureRuntime(ctx);
+    ctx.actions.register("trigger-backfill", async (_params, actionCtx) => {
+      // The host supplies the authorized company for this action; a non-owner is
+      // refused rather than silently backfilling the owner's data.
+      const rt = await ensureRuntime(ctx, actionCtx?.companyId ?? null);
       if (!rt) return { ok: false, error: RUNTIME_NOT_READY_MESSAGE };
+      const cid = rt.companyId;
       if (!rt.config.enableIntelligence || rt.intelligenceChannelIds.length === 0 || !rt.defaultGuildId) {
         return { ok: false, error: "Intelligence is disabled or no intelligence channels are configured." };
       }
@@ -2267,9 +2231,6 @@ const plugin = definePlugin({
   async onConfigChanged(newConfig, context): Promise<void> {
     const ctx = _pluginCtx;
     if (!ctx) return;
-
-    // A delivery is fresh information: let opportunistic bootstraps retry too.
-    nextOpportunisticBootstrapAt = 0;
 
     // Queue against every other bootstrap source, including other deliveries:
     // two concurrent saves would otherwise each open a gateway and leak one.
