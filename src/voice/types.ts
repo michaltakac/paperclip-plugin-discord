@@ -77,5 +77,16 @@ export interface STTAdapter {
 
 export interface TextChannelRelay {
   /** Post a transcript message to the configured text channel. */
-  postTranscript(text: string, metadata: { durationSec: number }): Promise<void>;
+  postTranscript(
+    text: string,
+    metadata: {
+      durationSec: number;
+      /**
+       * Whether the caller still has standing to write, asked again before any
+       * attempt beyond the first. Posting spans an await, and a retry launched
+       * after that await is a NEW write, not the completion of an old one.
+       */
+      isLive?: () => boolean;
+    },
+  ): Promise<void>;
 }

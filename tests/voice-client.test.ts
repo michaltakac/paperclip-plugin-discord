@@ -136,7 +136,10 @@ function readyHook() {
   };
 }
 
-function buildClient(overrides: Record<string, unknown> = {}) {
+function buildClient(
+  overrides: Record<string, unknown> = {},
+  options: { realRelay?: boolean } = {},
+) {
   const ctx = buildCtx();
   const hook = readyHook();
   const stt = { transcribeUtterance: vi.fn().mockResolvedValue("hello there") };
@@ -162,7 +165,7 @@ function buildClient(overrides: Record<string, unknown> = {}) {
       ...overrides,
     } as any,
     stt as any,
-    relay as any,
+    options.realRelay ? undefined : (relay as any),
   );
 
   return { client, ctx, hook, stt, relay, ingestUtterance, onAvailabilityChange, adapterDestroy };
@@ -310,8 +313,8 @@ describe("VoiceClient — a failed start leaks nothing and shows in health (F5)"
 });
 
 describe("VoiceClient — a receive-stream failure cannot kill the worker (F3)", () => {
-  async function joinedClient() {
-    const built = buildClient();
+  async function joinedClient(options: { realRelay?: boolean } = {}) {
+    const built = buildClient({}, options);
     await built.client.start();
     built.hook.fire();
     await vi.waitFor(() => expect(voiceState.connections).toHaveLength(1));
@@ -469,6 +472,52 @@ describe("VoiceClient — a receive-stream failure cannot kill the worker (F3)",
       "voice: not displaying an utterance ingested after shutdown",
       expect.objectContaining({ userId: "user-1" }),
     );
+  });
+
+  // N5: the relay's own 5xx retry sits on the far side of an await. A stop
+  // landing while the first POST is in flight must not start a second one.
+  it("does not retry the display post after the client was stopped (N5)", async () => {
+    const { client, connection } = await joinedClient({ realRelay: true });
+
+    let releaseFirstPost: (value: unknown) => void = () => {};
+    const fetchMock = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          releaseFirstPost = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    connection.receiver.speaking.emit("start", "user-1");
+    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(1));
+    connection.receiver.streams[0].end(HALF_SECOND_PCM);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    client.stop();
+    // Discord answers the in-flight request with a 5xx — the one status that
+    // would otherwise launch a fresh POST.
+    releaseFirstPost({ ok: false, status: 503, statusText: "Service Unavailable", text: async () => "" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("still retries a 5xx while the client is running", async () => {
+    // The guard must not cost the retry its actual purpose.
+    const { client, connection } = await joinedClient({ realRelay: true });
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 503, statusText: "Service Unavailable", text: async () => "" })
+      .mockResolvedValueOnce({ ok: true, status: 204, statusText: "No Content", text: async () => "" });
+    vi.stubGlobal("fetch", fetchMock);
+
+    connection.receiver.speaking.emit("start", "user-1");
+    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(1));
+    connection.receiver.streams[0].end(HALF_SECOND_PCM);
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    client.stop();
   });
 
   it("still ingests when the display webhook fails", async () => {

@@ -49,8 +49,9 @@ export class WebhookTextChannelRelay implements TextChannelRelay {
 
   async postTranscript(
     text: string,
-    _metadata: { durationSec: number },
+    metadata: { durationSec: number; isLive?: () => boolean },
   ): Promise<void> {
+    const isLive = metadata.isLive ?? (() => true);
     const trimmed = text.trim();
     if (trimmed.length === 0) {
       // Skip empty/whitespace — nothing meaningful was said.
@@ -70,8 +71,15 @@ export class WebhookTextChannelRelay implements TextChannelRelay {
       body,
     });
 
-    // Retry once on 5xx
+    // Retry once on 5xx.
+    //
+    // The first attempt was launched while the caller still had standing; this
+    // one would not be. Posting spans an await, and the client can be stopped
+    // inside it — by a retirement, a gateway replacement, or shutdown — so a
+    // retry decided purely by the response status would start a fresh display
+    // write into a channel this client has already left. Ask again first.
     if (resp.status >= 500 && resp.status < 600) {
+      if (!isLive()) return;
       resp = await fetch(this.webhookUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

@@ -145,4 +145,23 @@ describe("WebhookTextChannelRelay — mention safety", () => {
       expect(JSON.parse(opts.body as string).allowed_mentions).toEqual({ parse: [] });
     }
   });
+
+  it("skips the 5xx retry when the caller has lost standing", async () => {
+    // Unit-level twin of the client regression: the predicate alone decides.
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      statusText: "Service Unavailable",
+      text: async () => "",
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const relay = new WebhookTextChannelRelay({ webhookUrl: FAKE_URL });
+    await relay.postTranscript("something said", {
+      durationSec: 1,
+      isLive: () => false,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

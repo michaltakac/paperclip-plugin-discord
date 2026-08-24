@@ -392,7 +392,12 @@ export class VoiceClient {
     }
 
     try {
-      await this.relay.postTranscript(transcript, { durationSec });
+      await this.relay.postTranscript(transcript, {
+        durationSec,
+        // Carried in, for the same reason it is carried into the ingress: the
+        // relay's own retry sits on the far side of an await.
+        isLive: () => !this.stopped,
+      });
     } catch (err) {
       this.ctx.logger.error("voice: posting the transcript to the text channel failed", {
         userId,
