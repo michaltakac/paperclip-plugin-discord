@@ -30,7 +30,7 @@ import {
 } from "./formatters.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
-import { connectGateway, type MessageCreateEvent } from "./gateway.js";
+import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
 import {
   handleAcpOutput,
   routeMessageToAgent,
@@ -178,6 +178,54 @@ const RUNTIME_NOT_READY_MESSAGE =
 // `multiCompanyConfig` stays unset, so the host also fails a second company's
 // config closed rather than rebinding this worker.
 
+/**
+ * Everything one voice lifecycle owns, in one object bound to one runtime.
+ *
+ * Voice is full of work that finishes later — a transcription in flight, a
+ * webhook lookup in flight, a health note written minutes ago — and all of it
+ * has to agree about which runtime it belongs to. Ownership of an install can
+ * legitimately advance from one company to another (see `claimOwnership`), so
+ * an async completion that consults whatever runtime happens to be current when
+ * it lands can cross the company boundary: an utterance spoken under company A
+ * would be filed under company B, with B's credentials, on B's issue.
+ *
+ * Every async completion therefore consults THIS object, never the module-level
+ * runtime. `active` is the single answer to "does my work still count?", and it
+ * is false from the moment `stopVoice` runs. Because the session hangs off the
+ * runtime, retiring the runtime discards its health notes with it and the
+ * successor starts clean.
+ */
+type VoiceSession = {
+  /** The runtime this session serves. Never re-read from module state. */
+  readonly runtime: DiscordRuntime;
+  /** False from the moment this session is stopped; in-flight work must drop. */
+  active: boolean;
+  /** Tear-down for the voice client, installed before start() is awaited. */
+  stopClient: (() => void) | null;
+  /**
+   * Can voice connect at all? Set when the client reports itself unavailable,
+   * when startup fails, and when the gateway exposes no voice surface.
+   */
+  connectivityNote: string | null;
+  /**
+   * Can a transcribed utterance reach Paperclip? Independent of connectivity —
+   * a perfectly connected voice client with nowhere to send what it hears is a
+   * different problem, and being connected is no evidence that routing works.
+   */
+  routingNote: string | null;
+  /** Single-flight resolution of the text channel behind the voice webhook. */
+  textChannel: {
+    /** Resolved channel id, cached for the life of the session. */
+    channelId: string | null;
+    /** The lookup currently in flight, shared by every concurrent caller. */
+    inFlight: Promise<string | null> | null;
+    /** Epoch ms before which a failed lookup is not attempted again. */
+    retryAfter: number;
+    /** Keeps a persistently failing lookup from logging on every utterance. */
+    logged: boolean;
+  };
+};
+
 type DiscordRuntime = {
   companyId: string;
   config: DiscordConfig;
@@ -187,14 +235,24 @@ type DiscordRuntime = {
   baseUrl: string;
   cmdCtx: CommandContext;
   adapter: DiscordAdapter;
-  gateway: { close: () => void } | null;
+  gateway: GatewayHandle | null;
   /** Set when the gateway reports a permanent failure, so re-bootstrap reconnects. */
   gatewayFailed: boolean;
+  /**
+   * This runtime's voice lifecycle, or null when voice is disabled or has not
+   * started. Voice is owned by the runtime because it rides the runtime's
+   * gateway socket and speaks with the runtime's company: retiring the runtime
+   * must take voice with it, or a retired company's connection would keep
+   * listening and its pending work would land under whoever came next.
+   */
+  voice: VoiceSession | null;
   /**
    * Whether the live connection identified with message intents. Intents are
    * fixed at identify time, so a change here needs a reconnect.
    */
   listenForMessages: boolean;
+  /** Same, for the voice-state intent: voice cannot be added to a live socket. */
+  voiceEnabled: boolean;
   /** The first-install backfill runs at most once per runtime. */
   backfillStarted: boolean;
   defaultGuildId: string | null;
@@ -589,6 +647,18 @@ async function notify(
           eventType: event.eventType,
         },
       );
+      // And the channel-level pointer voice routes by. A spoken utterance is
+      // not a reply, so it has no message to inherit a destination from; this
+      // gives it "whatever this channel is currently about". Last notification
+      // wins — see `voiceTargetKey` for what that means at the read side.
+      await ctx.state.set(
+        { scopeKind: "instance", stateKey: voiceTargetKey(channelId) },
+        {
+          entityId: event.entityId,
+          entityType: event.entityType,
+          companyId: event.companyId,
+        },
+      );
     }
 
     await ctx.activity.log({
@@ -670,30 +740,163 @@ function buildEscalationEmbed(payload: EscalationCreatedPayload): {
   return { embeds, components };
 }
 
-/** Reply routing for inbound Discord messages. */
-async function handleMessageCreate(
+/**
+ * Where one piece of inbound text is going.
+ *
+ * A thread key names the conversation the text belongs to and is what decides
+ * the destination. `reply:<channelId>:<messageId>` is a typed reply to a message
+ * this plugin posted; `voice:<guildId>:<channelId>:<sessionId>` is one join of
+ * one voice channel. Adding a source means adding a thread-key form here, not a
+ * second way into Paperclip.
+ */
+type InboundDestination = {
+  entityId: string;
+  entityType: string;
+  companyId: string;
+};
+
+/**
+ * What became of one piece of inbound text.
+ *
+ * `no-destination` and `rejected` are both "nothing was written to Paperclip",
+ * but they mean different things to an operator: one is a configuration gap,
+ * the other a destination that exists and refused.
+ */
+type InboundOutcome = "routed" | "empty" | "no-destination" | "rejected" | "stale";
+
+/** State key holding what a text channel is currently about, for voice routing. */
+function voiceTargetKey(channelId: string): string {
+  return `voice_target_${channelId}`;
+}
+
+/** Trim a configured string to null when it carries nothing. */
+function trimToNull(value: string | undefined | null): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+/** Thread key for a typed reply to a message this plugin posted. */
+function replyThreadKey(channelId: string, messageId: string): string {
+  return `reply:${channelId}:${messageId}`;
+}
+
+/**
+ * Resolve a thread key to the Paperclip entity the text belongs to.
+ *
+ * Returns null when the key names nothing this install can route to — an
+ * unmapped reply, or voice with no configured destination. Callers drop the
+ * text rather than guessing.
+ */
+async function resolveInboundDestination(
   ctx: PluginContext,
   rt: DiscordRuntime,
-  message: MessageCreateEvent,
-): Promise<void> {
-  if (rt.config.enableInbound === false) return;
-  // Ignore bot messages
-  if (message.author.bot) return;
-  // Only handle replies to other messages
-  if (!message.message_reference?.message_id) return;
+  threadKey: string,
+  input: { channelId: string | null },
+): Promise<InboundDestination | null> {
+  if (threadKey.startsWith("reply:")) {
+    const [, channelId, messageId] = threadKey.split(":");
+    if (!channelId || !messageId) return null;
+    const mapping = (await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `msg_${channelId}_${messageId}`,
+    })) as InboundDestination | null;
+    return mapping ?? null;
+  }
 
-  const refChannelId = message.message_reference.channel_id ?? message.channel_id;
-  const refMessageId = message.message_reference.message_id;
+  if (threadKey.startsWith("voice:")) {
+    // A spoken utterance is not a reply to anything, so it has no message
+    // mapping to inherit. Two destinations, in order.
+    //
+    // First: what the transcript's own channel is currently about — the pointer
+    // `notify()` refreshes every time it posts there.
+    //
+    // KNOWN PHASE-1 PROPERTY: that pointer is last-notification-wins. It follows
+    // the most recent thing the plugin announced in the channel, not the thing
+    // the room is talking about, so a notification arriving mid-conversation
+    // moves where the next utterance lands. Phase 1 accepts this; a real
+    // conversation-scoped target needs state voice does not have yet.
+    if (input.channelId) {
+      const pointer = (await ctx.state.get({
+        scopeKind: "instance",
+        stateKey: voiceTargetKey(input.channelId),
+      })) as InboundDestination | null;
+      // Ownership can move between the write and the read (see `claimOwnership`).
+      // A pointer written for a company this install no longer serves must never
+      // route anything: dropping to the configured default is the safe direction,
+      // commenting under the wrong company is not.
+      if (pointer?.entityId && pointer.companyId === rt.companyId) {
+        return pointer;
+      }
+      if (pointer?.entityId) {
+        ctx.logger.info(
+          "voice: ignoring a channel target left by a previous owner of this install",
+          { runningCompanyId: rt.companyId, pointerCompanyId: pointer.companyId },
+        );
+      }
+    }
 
-  const mapping = await ctx.state.get({
-    scopeKind: "instance",
-    stateKey: `msg_${refChannelId}_${refMessageId}`,
-  }) as { entityId: string; entityType: string; companyId: string } | null;
+    // Then: the destination the operator configured, under the company that owns
+    // this install — never a company read from anywhere else (see "Runtime state").
+    const entityId = trimToNull(process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID);
+    if (!entityId) return null;
+    return { entityId, entityType: "issue", companyId: rt.companyId };
+  }
 
-  if (!mapping) return;
+  return null;
+}
 
-  const text = message.content;
-  if (!text?.trim()) return;
+/**
+ * The single inbound ingress: every route by which text from Discord reaches
+ * Paperclip goes through here.
+ *
+ * Both callers — the gateway's MESSAGE_CREATE router and the voice client —
+ * arrive with an already-decided destination and an author string. Voice calls
+ * this DIRECTLY. It does not post a message and hope the router picks it back
+ * up: its webhook transcript is display only, so there is no path by which
+ * anything this plugin writes to Discord can be read back in as input. That is
+ * what makes a transcript loop impossible by construction, and it is why the
+ * router below can keep refusing bot authors and non-replies unconditionally —
+ * no webhook, and no bot, is ever a trusted message source.
+ */
+async function ingestInbound(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  input: {
+    channelId: string | null;
+    /** Attributed author, in the `discord:...` form Paperclip stores. */
+    author: string;
+    /**
+     * Author as the escalation-resolved event has always reported it: the bare
+     * Discord username for a typed reply. Kept distinct from `author` so this
+     * refactor does not change an event payload other systems already read.
+     */
+    authorLabel: string;
+    text: string;
+    threadKey: string;
+    /**
+     * Whether the caller still has standing to write, asked again immediately
+     * before each side effect.
+     *
+     * Voice supplies this; the typed router does not, because a gateway message
+     * is handled synchronously with respect to ownership — there is no window in
+     * which it can go stale. Voice's is a long story: an utterance is
+     * transcribed, then a webhook is resolved, then a destination pointer is
+     * read, and ownership of the install can move at any of those awaits. The
+     * predicate is what makes "still ours?" true at the instant of the write
+     * rather than at some earlier instant that has since passed.
+     */
+    isLive?: () => boolean;
+  },
+): Promise<InboundOutcome> {
+  const text = input.text.trim();
+  if (!text) return "empty";
+  const isLive = input.isLive ?? (() => true);
+
+  const mapping = await resolveInboundDestination(ctx, rt, input.threadKey, input);
+  if (!mapping) return "no-destination";
+  // Destination resolution reads the channel pointer, and a retirement can
+  // interleave with that read.
+  if (!isLive()) return "stale";
 
   if (mapping.entityType === "escalation") {
     // Route to escalation response
@@ -712,10 +915,13 @@ async function handleMessageCreate(
       }) as EscalationRecord | null;
     }
 
+    // Two state reads happened above; nothing has been written yet.
+    if (!isLive()) return "stale";
+
     if (record && record.status === "pending") {
       record.status = "resolved";
       record.resolvedAt = new Date().toISOString();
-      record.resolvedBy = `discord:${message.author.username}`;
+      record.resolvedBy = input.author;
       record.resolution = "human_reply";
       await ctx.state.set(
         { scopeKind: "company", scopeId: escalationCompanyId, stateKey: `escalation_${mapping.entityId}` },
@@ -725,17 +931,22 @@ async function handleMessageCreate(
       ctx.events.emit("escalation-resolved", mapping.companyId, {
         escalationId: mapping.entityId,
         action: "human_reply",
-        resolvedBy: message.author.username,
+        resolvedBy: input.authorLabel,
         responseText: text,
       });
     }
 
     await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-    ctx.logger.info("Routed Discord reply to escalation", {
+    ctx.logger.info("Routed inbound Discord text to escalation", {
       escalationId: mapping.entityId,
-      from: message.author.username,
+      from: input.author,
+      threadKey: input.threadKey,
     });
-  } else if (mapping.entityType === "issue") {
+    return "routed";
+  }
+
+  if (mapping.entityType === "issue") {
+    if (!isLive()) return "stale";
     // Route to issue comment
     try {
       await paperclipFetch(
@@ -745,20 +956,62 @@ async function handleMessageCreate(
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             body: text,
-            authorUserId: `discord:${message.author.username}`,
+            authorUserId: input.author,
           }),
         },
         rt.paperclipBoardApiKey,
       );
       await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-      ctx.logger.info("Routed Discord reply to issue comment", {
+      ctx.logger.info("Routed inbound Discord text to issue comment", {
         issueId: mapping.entityId,
-        from: message.author.username,
+        from: input.author,
+        threadKey: input.threadKey,
       });
+      return "routed";
     } catch (err) {
-      ctx.logger.error("Failed to route inbound message", { error: String(err) });
+      // A destination that Paperclip rejects — the issue was deleted, it belongs
+      // to another company — must not take the pipeline down with it. The text
+      // is lost for this utterance and the transcript still shows in the channel.
+      ctx.logger.error("Failed to route inbound message", {
+        entityId: mapping.entityId,
+        threadKey: input.threadKey,
+        error: summarizeError(err, [rt.paperclipBoardApiKey]),
+      });
+      return "rejected";
     }
   }
+
+  return "no-destination";
+}
+
+/**
+ * Reply routing for inbound Discord messages.
+ *
+ * The trust boundary is here and is unchanged: a bot author is refused, and a
+ * message that is not a reply to something this plugin posted is refused. Voice
+ * does not relax either rule — it does not come through this function at all.
+ */
+async function handleMessageCreate(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  message: MessageCreateEvent,
+): Promise<void> {
+  if (rt.config.enableInbound === false) return;
+  // Ignore bot messages
+  if (message.author.bot) return;
+  // Only handle replies to other messages
+  if (!message.message_reference?.message_id) return;
+
+  const refChannelId = message.message_reference.channel_id ?? message.channel_id;
+  const refMessageId = message.message_reference.message_id;
+
+  await ingestInbound(ctx, rt, {
+    channelId: message.channel_id,
+    author: `discord:${message.author.username}`,
+    authorLabel: message.author.username,
+    text: message.content ?? "",
+    threadKey: replyThreadKey(refChannelId, refMessageId),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +1038,43 @@ async function handleMessageCreate(
  * outlive its ownership, least of all while the new owner's bootstrap is still
  * fallible.
  */
+/**
+ * Stop the runtime's voice client, if any. Never throws: voice tear-down runs on
+ * paths (retire, reconnect, shutdown) whose real work must proceed regardless.
+ *
+ * `disposition` says what to do with the stopped session:
+ *
+ * - `"tombstone"` leaves it attached, inactive, so the session that replaces it
+ *   can inherit what it learned. Voice going down with its socket says nothing
+ *   about whether utterances had anywhere to go, and a token rotation that
+ *   silently restored `ok` would hide a destination that is still missing.
+ * - `"discard"` detaches it, for teardown with nothing to hand on to: the
+ *   plugin is stopping, or the runtime itself is being retired.
+ *
+ * Either way the session is invalidated first, so work already in flight — a
+ * transcription, a webhook lookup — finds `active` false when it settles.
+ */
+function stopVoice(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  reason: string,
+  disposition: "tombstone" | "discard" = "tombstone",
+): void {
+  const session = rt.voice;
+  if (!session) return;
+  session.active = false;
+  rt.voice = disposition === "tombstone" ? session : null;
+  const stop = session.stopClient;
+  session.stopClient = null;
+  if (!stop) return;
+  try {
+    stop();
+    ctx.logger.info("voice: stopped", { reason });
+  } catch (err) {
+    ctx.logger.warn("voice: stop failed", { reason, error: summarizeError(err) });
+  }
+}
+
 function retireRuntime(ctx: PluginContext, reason: string): void {
   const previous = runtime;
   runtime = null;
@@ -793,6 +1083,7 @@ function retireRuntime(ctx: PluginContext, reason: string): void {
     companyId: previous.companyId,
     reason,
   });
+  stopVoice(ctx, previous, reason, "discard");
   if (previous.gateway) {
     try {
       previous.gateway.close();
@@ -972,6 +1263,8 @@ async function bootstrapRuntime(
   const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
   const defaultGuildId = normalizeDiscordId(config.defaultGuildId);
   const listenForMessages = gatewayNeedsMessages(config);
+  const voiceEnv = readVoiceEnv();
+  const voiceEnabled = voiceEnv !== null;
 
   // Reuse the live connection only when nothing it identified with has changed.
   // Intents are fixed when the socket identifies (src/gateway.ts), so a change to
@@ -981,7 +1274,8 @@ async function bootstrapRuntime(
       existing.gateway &&
       !existing.gatewayFailed &&
       existing.token === token &&
-      existing.listenForMessages === listenForMessages,
+      existing.listenForMessages === listenForMessages &&
+      existing.voiceEnabled === voiceEnabled,
   );
 
   // Refresh the EXISTING object rather than replacing it, so a reused gateway's
@@ -1013,8 +1307,13 @@ async function bootstrapRuntime(
   rt.escalationTimeoutMs = (config.escalationTimeoutMinutes || 30) * 60 * 1000;
   rt.digestMode = config.digestMode ?? "off";
   rt.listenForMessages = listenForMessages;
+  rt.voiceEnabled = voiceEnabled;
+  rt.voice = rt.voice ?? null;
 
   if (!reuseGateway) {
+    // Voice rides this socket's adapter; it cannot outlive the connection it
+    // subscribed to, so it goes down with the gateway it was started on.
+    if (existing) stopVoice(ctx, existing, "gateway replaced");
     const staleGateway = rt.gateway;
     rt.gateway = null;
     rt.gatewayFailed = false;
@@ -1072,11 +1371,17 @@ async function bootstrapRuntime(
         {
           listenForMessages,
           includeMessageContent: listenForMessages,
+          enableVoice: voiceEnabled,
           // Fatal close codes and identify-budget exhaustion stop the gateway
           // permanently; report it through plugin health instead of running
           // silently without realtime Discord connectivity.
           onPermanentFailure: (message, details) => {
-            if (runtime) runtime.gatewayFailed = true;
+            if (runtime) {
+              runtime.gatewayFailed = true;
+              // Voice signals over this socket; once it is permanently down the
+              // voice connection can neither rejoin nor be torn down cleanly later.
+              stopVoice(ctx, runtime, "gateway permanently down");
+            }
             runtimeHealth = { status: "degraded", message, details };
           },
         },
@@ -1096,6 +1401,13 @@ async function bootstrapRuntime(
   if (runtimeHealth.status !== "ok") {
     setRuntimeHealth({ status: "ok" });
   }
+
+  await startVoiceIfConfigured(ctx, rt, voiceEnv);
+  // The reset above cleared health wholesale. Voice's own notes are not the
+  // reset's to discard: a destination that was missing a moment ago is still
+  // missing, and a configuration save is no evidence otherwise.
+  refreshVoiceHealth(rt);
+
   ctx.logger.info("Discord plugin runtime started", {
     companyId,
     gateway: rt.gateway ? "connected" : "unavailable",
@@ -1104,6 +1416,353 @@ async function bootstrapRuntime(
 
   startBackfillIfEnabled(ctx, rt);
   return rt;
+}
+
+/** How long a failed webhook lookup is left alone before it is tried again. */
+const VOICE_WEBHOOK_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
+
+/**
+ * The text channel a voice webhook posts into.
+ *
+ * Discord's webhook object carries `channel_id`; the URL does not. Voice needs
+ * it to find what that channel is currently about, so it has to be asked for.
+ *
+ * SINGLE-FLIGHT: at most one lookup is ever in flight for a session, and every
+ * concurrent caller shares its result. Several people speaking at once finish
+ * their utterances at once, and without this each of them would issue its own
+ * credential-bearing GET for the same value. A success is cached for the life of
+ * the session; a failure is retried, but not before the cooldown, because a
+ * webhook that is failing is usually revoked or deleted rather than briefly
+ * unwell, and utterances arrive every few seconds while someone is speaking.
+ *
+ * Every failure path returns null, which costs nothing worse than falling back
+ * to the configured default destination.
+ *
+ * The URL is a credential — it authorizes posting to the channel — so it is
+ * never logged, not even on failure.
+ */
+async function resolveVoiceTextChannelId(
+  ctx: PluginContext,
+  session: VoiceSession,
+  webhookUrl: string,
+): Promise<string | null> {
+  const state = session.textChannel;
+  if (state.channelId) return state.channelId;
+  if (state.inFlight) return state.inFlight;
+  if (Date.now() < state.retryAfter) return null;
+
+  // Deliberately cannot reject: concurrent callers share this promise, and one
+  // rejection would surface as an unhandled rejection in every one of them.
+  const lookup = (async (): Promise<string | null> => {
+    try {
+      const response = await fetch(webhookUrl, { method: "GET" });
+      if (!response.ok) throw new Error(`webhook lookup returned ${response.status}`);
+      const webhook = (await response.json()) as { channel_id?: unknown };
+      const channelId = normalizeDiscordId(webhook.channel_id);
+      if (!channelId) throw new Error("webhook carries no channel id");
+      state.channelId = channelId;
+      return channelId;
+    } catch (err) {
+      // Armed inside, so every caller sharing this promise leaves with the
+      // cooldown already in place rather than racing to start another attempt.
+      state.retryAfter = Date.now() + VOICE_WEBHOOK_RETRY_COOLDOWN_MS;
+      if (!state.logged) {
+        state.logged = true;
+        ctx.logger.warn(
+          "voice: could not resolve the transcript channel from its webhook; " +
+            "utterances will use the configured default destination",
+          { error: summarizeError(err, [webhookUrl]) },
+        );
+      }
+      return null;
+    }
+  })();
+
+  state.inFlight = lookup;
+  try {
+    return await lookup;
+  } finally {
+    state.inFlight = null;
+  }
+}
+
+/** Health issue code for voice that cannot connect. */
+const VOICE_UNAVAILABLE_ISSUE = "discord-voice-unavailable";
+/** Health issue code for voice that runs but has nowhere to send what it hears. */
+const VOICE_DISPLAY_ONLY_ISSUE = "discord-voice-display-only";
+
+/**
+ * Recompute plugin health from the session's two voice concerns.
+ *
+ * Connectivity and routing are independent and neither is evidence about the
+ * other: a voice client that just reconnected still has nowhere to send what it
+ * hears if nothing configured a destination, and a perfectly routed install can
+ * lose its connection. They are therefore tracked separately and only ever
+ * cleared by something that actually proves the concern is resolved — a
+ * connection coming up for connectivity, an utterance actually reaching
+ * Paperclip for routing.
+ *
+ * A non-voice degradation always outranks both: an unresolvable bot token is a
+ * bigger problem than voice, and voice must never overwrite it or clear it.
+ */
+function refreshVoiceHealth(rt: DiscordRuntime): void {
+  const issue = (runtimeHealth.details as { issue?: unknown } | undefined)?.issue;
+  const currentIsVoice =
+    issue === VOICE_UNAVAILABLE_ISSUE || issue === VOICE_DISPLAY_ONLY_ISSUE;
+  if (runtimeHealth.status !== "ok" && !currentIsVoice) return;
+
+  const session = rt.voice;
+  // Connectivity first: with no connection there is nothing to route.
+  if (session?.connectivityNote) {
+    degradeHealth(
+      `[${PLUGIN_ID}] voice is unavailable: ${session.connectivityNote}`,
+      VOICE_UNAVAILABLE_ISSUE,
+      { companyId: rt.companyId },
+    );
+    return;
+  }
+  if (session?.routingNote) {
+    degradeHealth(
+      `[${PLUGIN_ID}] voice transcripts display-only: ${session.routingNote}`,
+      VOICE_DISPLAY_ONLY_ISSUE,
+      { companyId: rt.companyId },
+    );
+    return;
+  }
+  if (currentIsVoice) setRuntimeHealth({ status: "ok" });
+}
+
+/**
+ * Surface what happened to a spoken utterance through plugin health.
+ *
+ * An operator who wired voice expects what is said in the channel to reach
+ * Paperclip. When it does not, "ok" is the wrong answer — but so is a hard
+ * failure: the transcript still posts, the room still has its record, and text
+ * routing is untouched. Degraded, with a value-free note, is the honest state.
+ *
+ * Only a successfully routed utterance clears this. Nothing else can: neither a
+ * reconnection nor a configuration save is evidence that a destination exists.
+ */
+function reportVoiceIngestOutcome(
+  ctx: PluginContext,
+  session: VoiceSession,
+  outcome: InboundOutcome,
+): void {
+  // "stale" means the caller lost standing mid-flight: it wrote nothing, and it
+  // has nothing to say about the health of whoever owns the install now.
+  if (outcome === "empty" || outcome === "stale") return;
+  session.routingNote =
+    outcome === "routed"
+      ? null
+      : outcome === "no-destination"
+        ? "no destination configured"
+        : "the destination rejected the comment";
+  if (outcome !== "routed") {
+    ctx.logger.info("voice: transcript posted to the channel but not ingested", { outcome });
+  }
+  refreshVoiceHealth(session.runtime);
+}
+
+/**
+ * The install command every "voice deps are missing" log line ends with.
+ *
+ * Duplicated from `src/voice/client.ts` on purpose: importing it from there
+ * would be a static import of the module whose entire point is to load lazily.
+ */
+const VOICE_DEPS_INSTALL_HINT =
+  "npm install @discordjs/voice prism-media opusscript@0.0.8 libsodium-wrappers ws";
+
+/**
+ * Start the voice client for this runtime, if voice is configured.
+ *
+ * Voice is optional in the strongest sense: its peer dependencies may not be
+ * installed at all, so the whole subsystem sits behind one dynamic import that
+ * is never reached when the environment does not ask for voice. Nothing in here
+ * may propagate — a plugin whose text routing works must keep working when voice
+ * does not.
+ *
+ * Everything this creates is bound to ONE session object owned by `rt`. The
+ * callbacks below close over that session and over `rt`, and never read the
+ * module-level runtime: by the time an utterance finishes, the install may
+ * belong to a different company.
+ */
+async function startVoiceIfConfigured(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  voiceEnv: ReturnType<typeof readVoiceEnv>,
+): Promise<void> {
+  if (!voiceEnv) {
+    ctx.logger.info(
+      "voice: disabled — set DISCORD_VOICE_GUILD_ID, DISCORD_VOICE_CHANNEL_ID, " +
+        "DISCORD_VOICE_WEBHOOK_URL and DEEPGRAM_API_KEY to enable it",
+    );
+    return;
+  }
+  // A live session owns this runtime's voice; a stopped one is only still here
+  // to carry the health note explaining why, and a new attempt replaces it.
+  if (rt.voice?.active) return;
+
+  const session: VoiceSession = {
+    runtime: rt,
+    active: true,
+    stopClient: null,
+    connectivityNote: null,
+    // A destination problem outlives a restart — nothing about starting the
+    // client again proves an utterance now has somewhere to go.
+    routingNote: rt.voice?.routingNote ?? null,
+    textChannel: { channelId: null, inFlight: null, retryAfter: 0, logged: false },
+  };
+  rt.voice = session;
+
+  const gatewayVoice = rt.gateway?.voice;
+  if (!gatewayVoice) {
+    // The operator configured voice and the gateway came back with no voice
+    // surface at all — no gateway URL, or the connection was never established.
+    // Voice cannot arm, and saying nothing here is what let health read `ok`
+    // while explicitly configured voice was silently absent.
+    session.connectivityNote = "the Discord gateway is not connected";
+    ctx.logger.warn(
+      "voice: configured, but the gateway exposes no voice surface — continuing without voice",
+    );
+    refreshVoiceHealth(rt);
+    return;
+  }
+
+  /**
+   * Does work that started under this session still count?
+   *
+   * Both halves matter. `active` catches a session that was stopped. The runtime
+   * identity check catches ownership advancing to another company: same-owner
+   * redelivery refreshes the existing runtime object in place, so it still
+   * matches, while an advancement builds a new one and this fails.
+   */
+  const stillOurs = (): boolean => session.active && runtime === rt;
+
+  try {
+    const { VoiceClient, createPluginDiscordAdapter } = await import("./voice/index.js");
+
+    // Loading the voice module is an await like any other, and a permanent
+    // gateway failure or plugin shutdown can tear this session down while it is
+    // pending. Constructing a client now would arm one that nothing can reach:
+    // its stop closure would be installed on a session already detached, so no
+    // later teardown could find it.
+    if (!stillOurs()) {
+      ctx.logger.info("voice: startup abandoned — the session was stopped while loading", {
+        companyId: rt.companyId,
+      });
+      return;
+    }
+
+    const voiceClient = new VoiceClient(ctx, {
+      guildId: voiceEnv.guildId,
+      voiceChannelId: voiceEnv.voiceChannelId,
+      textChannelWebhookUrl: voiceEnv.webhookUrl,
+      deepgramApiKey: voiceEnv.deepgramApiKey,
+      relayUsername: voiceEnv.relayUsername,
+      voiceAdapterCreator: createPluginDiscordAdapter(gatewayVoice),
+      // Joining is driven by the gateway's own READY/RESUMED boundary, never by
+      // this call returning: an op-4 sent before the socket has identified is
+      // not deliverable, and @discordjs/voice does not retry one it could not send.
+      onGatewayReady: (handler) => gatewayVoice.onGatewayReady(handler),
+      // Voice reaches Paperclip HERE, through the same ingress as a typed reply.
+      // The webhook transcript is display only.
+      ingestUtterance: async (utterance) => {
+        // The channel voice routes by is the one the transcript appears in, not
+        // the voice channel it was spoken in: that is where notifications land,
+        // and so it is the only one that has a target to inherit.
+        const channelId = await resolveVoiceTextChannelId(ctx, session, voiceEnv.webhookUrl);
+
+        // Checked after every await and immediately before the write. An
+        // utterance that outlived its owner must not be filed under whoever
+        // owns the install now — it would be spoken content from one company
+        // posted with another company's credentials — and it must not touch the
+        // successor's health either, since it says nothing about the successor.
+        if (!stillOurs()) {
+          ctx.logger.info(
+            "voice: dropping an utterance whose runtime is no longer current",
+            { companyId: rt.companyId },
+          );
+          return;
+        }
+
+        const ingested = await ingestInbound(ctx, rt, {
+          channelId,
+          author: `discord:voice:${utterance.userId}`,
+          authorLabel: `voice:${utterance.userId}`,
+          text: utterance.text,
+          threadKey: utterance.threadKey,
+          // Carried INTO the ingress: the destination read is another await, and
+          // a check out here cannot speak for what is true on the far side of it.
+          isLive: stillOurs,
+        });
+        if (!stillOurs()) return;
+        reportVoiceIngestOutcome(ctx, session, ingested);
+      },
+      onAvailabilityChange: (available, reason) => {
+        if (!stillOurs()) return;
+        // Connectivity ONLY. A connection coming up is no evidence that an
+        // utterance has anywhere to go, so it never clears the routing note.
+        session.connectivityNote = available
+          ? null
+          : // `reason` is one of a fixed set of phrases (see VoiceUnavailableReason):
+            // nothing a failure was holding — a URL, a key — can reach health here.
+            (reason ?? "reason not reported");
+        refreshVoiceHealth(rt);
+      },
+    });
+    // Retained BEFORE start() is awaited: a client that fails after construction
+    // still has a connection and gateway subscriptions that must be released.
+    session.stopClient = () => voiceClient.stop();
+    await voiceClient.start();
+  } catch (error) {
+    stopVoice(ctx, rt, "voice startup failed", "tombstone");
+    const missingDeps =
+      error instanceof Error &&
+      (error as NodeJS.ErrnoException).code === "ERR_MODULE_NOT_FOUND";
+    ctx.logger.error(
+      missingDeps
+        ? "voice: optional voice dependencies are not installed — continuing without voice. " +
+            `Install them with: ${VOICE_DEPS_INSTALL_HINT}`
+        : "voice: startup failed (continuing without voice)",
+      { error: summarizeError(error) },
+    );
+    // The operator explicitly configured voice; saying "ok" while it is dead is
+    // the failure mode that hides this from them entirely. The tombstone left by
+    // stopVoice is what carries the reason until something replaces it.
+    session.connectivityNote = missingDeps
+      ? "the optional voice dependencies are not installed"
+      : "it could not be started";
+    refreshVoiceHealth(rt);
+  }
+}
+
+/**
+ * Voice is configured from the environment, not from company config.
+ *
+ * Phase 1 deliberately keeps voice off the settings surface: the operator wires
+ * the four variables on the container, and an install that sets none of them
+ * behaves exactly as it did before voice existed. Returns null unless all four
+ * required variables are present, so a half-configured voice never half-starts.
+ */
+function readVoiceEnv(): {
+  guildId: string;
+  voiceChannelId: string;
+  webhookUrl: string;
+  deepgramApiKey: string;
+  relayUsername: string | undefined;
+} | null {
+  const guildId = process.env.DISCORD_VOICE_GUILD_ID;
+  const voiceChannelId = process.env.DISCORD_VOICE_CHANNEL_ID;
+  const webhookUrl = process.env.DISCORD_VOICE_WEBHOOK_URL;
+  const deepgramApiKey = process.env.DEEPGRAM_API_KEY;
+  if (!guildId || !voiceChannelId || !webhookUrl || !deepgramApiKey) return null;
+  return {
+    guildId,
+    voiceChannelId,
+    webhookUrl,
+    deepgramApiKey,
+    relayUsername: process.env.DISCORD_VOICE_USERNAME,
+  };
 }
 
 /** Whether this configuration needs the message-carrying gateway intents. */
@@ -1284,6 +1943,7 @@ const plugin = definePlugin({
     // flag against the live config, and no-ops until the runtime exists.
 
     ctx.events.on("plugin.stopping", async () => {
+      if (runtime) stopVoice(ctx, runtime, "plugin stopping", "discard");
       runtime?.gateway?.close();
     });
 

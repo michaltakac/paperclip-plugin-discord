@@ -4,6 +4,7 @@ import { DISCORD_API_BASE, METRIC_NAMES } from "./constants.js";
 const GATEWAY_VERSION = "10";
 const GATEWAY_ENCODING = "json";
 const GUILD_INTENT = 1;
+const GUILD_VOICE_STATES_INTENT = 128;
 const GUILD_MESSAGES_INTENT = 512;
 const MESSAGE_CONTENT_INTENT = 32768;
 
@@ -76,12 +77,89 @@ export interface MessageCreateEvent {
   };
 }
 
+/** VOICE_STATE_UPDATE dispatch payload (op 0, t = VOICE_STATE_UPDATE). */
+export interface VoiceStateUpdateEvent {
+  guild_id?: string;
+  channel_id: string | null;
+  user_id: string;
+  session_id: string;
+  // Other fields exist (member, mute, deaf, ...) but a voice adapter only needs the above.
+  [key: string]: unknown;
+}
+
+/** VOICE_SERVER_UPDATE dispatch payload (op 0, t = VOICE_SERVER_UPDATE). */
+export interface VoiceServerUpdateEvent {
+  token: string;
+  guild_id: string;
+  endpoint: string | null;
+  [key: string]: unknown;
+}
+
+/** Arbitrary gateway payload (used by voice.sendPayload to emit op 4 voice state updates). */
+export interface GatewaySendPayload {
+  op: number;
+  d: unknown;
+}
+
 type InteractionHandler = (interaction: InteractionCreateEvent) => Promise<unknown>;
 type MessageHandler = (message: MessageCreateEvent) => Promise<void>;
+type VoiceStateUpdateHandler = (event: VoiceStateUpdateEvent) => void;
+type VoiceServerUpdateHandler = (event: VoiceServerUpdateEvent) => void;
+type GatewayReadyHandler = () => void;
+
+/**
+ * Voice primitives surfaced on the gateway handle when `enableVoice` is true.
+ * They plug straight into a @discordjs/voice DiscordGatewayAdapterCreator.
+ *
+ * This is deliberately the ONLY seam voice gets into the gateway: it may send a
+ * frame on whichever socket is current and subscribe to two dispatch events. It
+ * never sees the socket, the reconnect policy, or the session state, so voice
+ * can neither open a second gateway connection nor perturb reconnect behaviour.
+ */
+export interface GatewayVoiceHandle {
+  /**
+   * Send a raw gateway payload (typically op 4 voice-state-update) on the
+   * current socket. Returns false when there is no OPEN socket right now —
+   * callers must treat a false return as "not sent", never as fire-and-forget.
+   */
+  sendPayload(payload: GatewaySendPayload): boolean;
+  /** Subscribe to VOICE_STATE_UPDATE dispatch events. Returns an unsubscribe function. */
+  onVoiceStateUpdate(handler: VoiceStateUpdateHandler): () => void;
+  /** Subscribe to VOICE_SERVER_UPDATE dispatch events. Returns an unsubscribe function. */
+  onVoiceServerUpdate(handler: VoiceServerUpdateHandler): () => void;
+  /**
+   * Subscribe to the gateway's READY/RESUMED boundary. Returns an unsubscribe
+   * function.
+   *
+   * Voice signalling is only deliverable once the socket has identified: an op-4
+   * sent before that is either refused by `sendPayload` (no OPEN socket yet) or
+   * written to a socket Discord has no session for, and @discordjs/voice treats
+   * an undelivered join as terminal rather than retrying when the adapter later
+   * becomes usable. So joining is driven from here and from nowhere else — the
+   * first signal starts voice, and every later one (a resume, or a fresh
+   * identify after a reconnect) rejoins.
+   *
+   * This is a notification, not a control surface: handlers cannot influence
+   * reconnect, which stays owned by `scheduleReconnect` alone.
+   */
+  onGatewayReady(handler: GatewayReadyHandler): () => void;
+}
+
+export interface GatewayHandle {
+  close: () => void;
+  /** Present only when `options.enableVoice` was true and a socket was established. */
+  voice?: GatewayVoiceHandle;
+}
 
 export interface GatewayOptions {
   listenForMessages?: boolean;
   includeMessageContent?: boolean;
+  /**
+   * Add the GUILD_VOICE_STATES intent and dispatch VOICE_STATE_UPDATE /
+   * VOICE_SERVER_UPDATE to subscribers via the returned `voice` handle.
+   * Defaults to false — existing callers see no behaviour change.
+   */
+  enableVoice?: boolean;
   /**
    * Called when the gateway gives up permanently (fatal close code or identify
    * budget exhausted). The worker uses this to surface plugin health instead of
@@ -195,7 +273,7 @@ export async function connectGateway(
   onInteraction: InteractionHandler,
   onMessage?: MessageHandler,
   options: GatewayOptions = {},
-): Promise<{ close: () => void }> {
+): Promise<GatewayHandle> {
   if (typeof WebSocket === "undefined") {
     ctx.logger.warn(
       "WebSocket is not available in this environment (requires Node.js >= 21). " +
@@ -227,10 +305,44 @@ export async function connectGateway(
 
   const listenForMessages = options.listenForMessages ?? Boolean(onMessage);
   const includeMessageContent = options.includeMessageContent ?? listenForMessages;
+  const enableVoice = options.enableVoice ?? false;
   const intents =
     GUILD_INTENT |
+    (enableVoice ? GUILD_VOICE_STATES_INTENT : 0) |
     (listenForMessages ? GUILD_MESSAGES_INTENT : 0) |
     (includeMessageContent ? MESSAGE_CONTENT_INTENT : 0);
+
+  // Voice dispatch subscribers. Sets (not arrays) so subscribers can be removed
+  // when a voice connection is destroyed — a leaked handler would keep firing
+  // across reconnects and outlive the connection it was registered for.
+  const voiceStateUpdateHandlers = new Set<VoiceStateUpdateHandler>();
+  const voiceServerUpdateHandlers = new Set<VoiceServerUpdateHandler>();
+  const gatewayReadyHandlers = new Set<GatewayReadyHandler>();
+  /**
+   * Whether the current socket has reached READY/RESUMED.
+   *
+   * Kept so a subscriber that arrives after the boundary is not left waiting for
+   * the next one — on a reused connection there may never be a next one.
+   */
+  let gatewayReady = false;
+
+  function dispatchVoice<T>(
+    handlers: Set<(event: T) => void>,
+    event: T,
+    label: string,
+  ): void {
+    for (const handler of handlers) {
+      try {
+        handler(event);
+      } catch (error) {
+        // A throwing voice handler must never break gateway dispatch — the
+        // message/interaction path shares this switch.
+        ctx.logger.error(`${label} handler error`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
 
   function isCurrent(sock: GatewaySocket): boolean {
     return !closed && currentSocket === sock;
@@ -281,6 +393,7 @@ export async function connectGateway(
 
   function goPermanentlyDown(message: string, details?: Record<string, unknown>): void {
     permanentlyDown = true;
+    gatewayReady = false;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
@@ -362,6 +475,10 @@ export async function connectGateway(
 
   function connect(url: string, resumeIntent: boolean): void {
     if (closed || permanentlyDown) return;
+
+    // A new socket has not identified yet; the previous one's readiness says
+    // nothing about it.
+    gatewayReady = false;
 
     if (currentSocket) {
       // Defensive: no path should get here with a live socket, but if one
@@ -484,12 +601,16 @@ export async function connectGateway(
             sock.readyAt = Date.now();
             clearConnectTimer(sock);
             ctx.logger.info("Gateway ready", { sessionId, generation: gen });
+            gatewayReady = true;
+            if (enableVoice) dispatchVoice(gatewayReadyHandlers, undefined, "Gateway ready");
           }
 
           if (payload.t === "RESUMED") {
             sock.readyAt = Date.now();
             clearConnectTimer(sock);
             ctx.logger.info("Gateway resumed successfully", { generation: gen });
+            gatewayReady = true;
+            if (enableVoice) dispatchVoice(gatewayReadyHandlers, undefined, "Gateway ready");
           }
 
           if (payload.t === "INTERACTION_CREATE") {
@@ -502,6 +623,22 @@ export async function connectGateway(
                 error: error instanceof Error ? error.message : String(error),
               });
             }
+          }
+
+          if (enableVoice && payload.t === "VOICE_STATE_UPDATE") {
+            dispatchVoice(
+              voiceStateUpdateHandlers,
+              payload.d as VoiceStateUpdateEvent,
+              "Voice state update",
+            );
+          }
+
+          if (enableVoice && payload.t === "VOICE_SERVER_UPDATE") {
+            dispatchVoice(
+              voiceServerUpdateHandlers,
+              payload.d as VoiceServerUpdateEvent,
+              "Voice server update",
+            );
           }
 
           if (payload.t === "MESSAGE_CREATE" && onMessage) {
@@ -560,6 +697,7 @@ export async function connectGateway(
       clearConnectTimer(sock);
       if (!isCurrent(sock)) return; // stale socket: never log, never reconnect
       currentSocket = null;
+      gatewayReady = false;
       ctx.logger.info("Gateway WebSocket closed", {
         code: event.code,
         reason: event.reason,
@@ -626,9 +764,13 @@ export async function connectGateway(
 
   connect(gatewayUrl, false);
 
-  return {
+  const handle: GatewayHandle = {
     close: () => {
       closed = true;
+      gatewayReady = false;
+      voiceStateUpdateHandlers.clear();
+      voiceServerUpdateHandlers.clear();
+      gatewayReadyHandlers.clear();
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -639,6 +781,43 @@ export async function connectGateway(
       }
     },
   };
+
+  if (enableVoice) {
+    handle.voice = {
+      // Resolves `currentSocket` at call time and goes through safeSend, so a
+      // voice frame is never written to a superseded socket and never to one
+      // that is not OPEN. Capturing a socket here is what would reintroduce the
+      // unguarded-send and parallel-connection failures fixed in #71.
+      sendPayload(payload: GatewaySendPayload): boolean {
+        if (closed || permanentlyDown || !currentSocket) return false;
+        return safeSend(currentSocket, payload);
+      },
+      onVoiceStateUpdate(handler: VoiceStateUpdateHandler): () => void {
+        voiceStateUpdateHandlers.add(handler);
+        return () => voiceStateUpdateHandlers.delete(handler);
+      },
+      onVoiceServerUpdate(handler: VoiceServerUpdateHandler): () => void {
+        voiceServerUpdateHandlers.add(handler);
+        return () => voiceServerUpdateHandlers.delete(handler);
+      },
+      onGatewayReady(handler: GatewayReadyHandler): () => void {
+        gatewayReadyHandlers.add(handler);
+        // Already past the boundary: deliver it now rather than wait for a next
+        // one that a healthy connection has no reason to produce. Deferred by a
+        // microtask so subscribing never runs the handler re-entrantly.
+        if (gatewayReady) {
+          queueMicrotask(() => {
+            if (gatewayReady && gatewayReadyHandlers.has(handler)) {
+              dispatchVoice(new Set([handler]), undefined, "Gateway ready");
+            }
+          });
+        }
+        return () => gatewayReadyHandlers.delete(handler);
+      },
+    };
+  }
+
+  return handle;
 }
 
 async function getGatewayUrl(ctx: PluginContext, token: string): Promise<string | null> {
