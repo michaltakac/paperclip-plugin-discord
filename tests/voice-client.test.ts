@@ -94,6 +94,8 @@ vi.mock("@discordjs/voice", () => {
   };
 });
 
+const { decoders } = vi.hoisted(() => ({ decoders: [] as PassThrough[] }));
+
 vi.mock("prism-media", () => ({
   default: {
     opus: {
@@ -102,6 +104,7 @@ vi.mock("prism-media", () => ({
       Decoder: class extends PassThrough {
         constructor(_opts: unknown) {
           super();
+          decoders.push(this);
         }
       },
     },
@@ -169,6 +172,7 @@ function buildClient(overrides: Record<string, unknown> = {}) {
 const HALF_SECOND_PCM = Buffer.alloc(48_000);
 
 beforeEach(() => {
+  decoders.length = 0;
   voiceState.connections.length = 0;
   voiceState.becomesReady = true;
   voiceState.joinThrows = false;
@@ -342,22 +346,36 @@ describe("VoiceClient — a receive-stream failure cannot kill the worker (F3)",
     }
   });
 
-  it("survives a decoder error the same way", async () => {
-    const { client, connection, stt, ctx } = await joinedClient();
+  it("survives an error on the decoder itself", async () => {
+    const { client, connection, stt, ingestUtterance, ctx } = await joinedClient();
 
-    connection.receiver.speaking.emit("start", "user-1");
-    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(1));
+    const uncaught: unknown[] = [];
+    const onUncaught = (err: unknown) => uncaught.push(err);
+    process.on("uncaughtException", onUncaught);
+    try {
+      // start() already built one decoder as the Opus preflight probe; the
+      // utterance's own decoder is the next one.
+      const before = decoders.length;
+      connection.receiver.speaking.emit("start", "user-1");
+      await vi.waitFor(() => expect(decoders.length).toBe(before + 1));
 
-    const source = connection.receiver.streams[0];
-    source.write(Buffer.alloc(8));
-    // The decoder is downstream of the pipe; failing it must settle the same path.
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    source.destroy(new Error("Could not decode opus frame"));
-    await new Promise((resolve) => setTimeout(resolve, 20));
+      // The decoder, not the source: the two are separate failure surfaces and
+      // each needs its own listener. prism-media's decoder destroys itself with
+      // an error on a malformed frame.
+      decoders[before].destroy(new Error("Could not decode opus frame"));
+      await new Promise((resolve) => setTimeout(resolve, 20));
 
-    expect(stt.transcribeUtterance).not.toHaveBeenCalled();
-    expect(ctx.logger.error).toHaveBeenCalled();
-    client.stop();
+      expect(uncaught).toHaveLength(0);
+      expect(stt.transcribeUtterance).not.toHaveBeenCalled();
+      expect(ingestUtterance).not.toHaveBeenCalled();
+      expect(ctx.logger.error).toHaveBeenCalledWith(
+        "voice: utterance dropped",
+        expect.objectContaining({ stage: "decode", userId: "user-1" }),
+      );
+    } finally {
+      process.off("uncaughtException", onUncaught);
+      client.stop();
+    }
   });
 
   it("still delivers a clean utterance to ingress and then to the channel", async () => {
@@ -392,6 +410,36 @@ describe("VoiceClient — a receive-stream failure cannot kill the worker (F3)",
     expect(stt.transcribeUtterance).not.toHaveBeenCalled();
     expect(ingestUtterance).not.toHaveBeenCalled();
     client.stop();
+  });
+
+  it("drops an utterance transcribed after the client was stopped (N1)", async () => {
+    // Transcription is the long wait in this pipeline and stop() cannot reach
+    // into it. By the time a held STT resolves, the install may belong to
+    // another company — so nothing from it may be ingested or displayed.
+    const { client, connection, stt, relay, ingestUtterance, ctx } = await joinedClient();
+
+    let releaseStt: (value: string) => void = () => {};
+    stt.transcribeUtterance.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        releaseStt = resolve;
+      }),
+    );
+
+    connection.receiver.speaking.emit("start", "user-1");
+    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(1));
+    connection.receiver.streams[0].end(HALF_SECOND_PCM);
+    await vi.waitFor(() => expect(stt.transcribeUtterance).toHaveBeenCalledTimes(1));
+
+    client.stop();
+    releaseStt("words spoken before the handover");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(ingestUtterance).not.toHaveBeenCalled();
+    expect(relay.postTranscript).not.toHaveBeenCalled();
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      "voice: dropping an utterance transcribed after shutdown",
+      expect.objectContaining({ userId: "user-1" }),
+    );
   });
 
   it("still ingests when the display webhook fails", async () => {

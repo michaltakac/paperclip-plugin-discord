@@ -29,7 +29,11 @@ vi.mock("@paperclipai/plugin-sdk", () => ({
   runWorker: vi.fn(),
 }));
 
-const { gatewayConnects } = vi.hoisted(() => ({ gatewayConnects: [] as any[] }));
+const { gatewayConnects, gatewayState } = vi.hoisted(() => ({
+  gatewayConnects: [] as any[],
+  /** `inert` models connectGateway returning a handle with no voice surface. */
+  gatewayState: { inert: false },
+}));
 
 vi.mock("../src/gateway.js", () => ({
   connectGateway: vi.fn(async (_ctx: any, token: string, onInteraction: any, onMessage: any, options: any) => {
@@ -47,7 +51,7 @@ vi.mock("../src/gateway.js", () => ({
         record.closed = true;
       },
     };
-    if (options?.enableVoice) {
+    if (options?.enableVoice && !gatewayState.inert) {
       record.voice = {
         sendPayload: () => true,
         onVoiceStateUpdate: () => () => {},
@@ -86,7 +90,7 @@ vi.mock("../src/voice/index.js", () => ({
   },
 }));
 
-import { _resetRuntimeForTests } from "../src/worker.js";
+import { _resetRuntimeForTests, _getRuntimeForTests } from "../src/worker.js";
 import { _resetCompanyIdCache } from "../src/company-resolver.js";
 
 const COMPANY_A = "11111111-1111-1111-1111-111111111111";
@@ -198,8 +202,8 @@ function gateway(): any {
 }
 
 /** The voice client's config, as the worker handed it over. */
-function voiceConfig(): any {
-  return voiceClients[voiceClients.length - 1].config;
+function voiceConfig(index = voiceClients.length - 1): any {
+  return voiceClients[index].config;
 }
 
 function typedMessage(overrides: Record<string, unknown> = {}) {
@@ -223,6 +227,7 @@ beforeEach(() => {
   gatewayConnects.length = 0;
   voiceClients.length = 0;
   voiceModule.startRejectsWith = null;
+  gatewayState.inert = false;
   commentPostFails = false;
   vi.clearAllMocks();
 
@@ -272,6 +277,11 @@ afterEach(() => {
 /** Every issue-comment POST the plugin made. */
 function commentPosts() {
   return fetchMock.mock.calls.filter(([url]: any[]) => String(url).includes("/comments"));
+}
+
+/** Every webhook-object GET the plugin made. */
+function webhookLookups() {
+  return fetchMock.mock.calls.filter(([url]: any[]) => String(url).includes("/api/webhooks/"));
 }
 
 describe("inbound ingress — one path for typed replies and voice (F1)", () => {
@@ -631,6 +641,218 @@ describe("voice destination — channel target, then configured default", () => 
   });
 });
 
+// ---------------------------------------------------------------------------
+// N1 — an utterance that outlives its owner.
+//
+// Ownership of an install can legitimately advance from company A to company B
+// (claimOwnership's equal-config rule). Voice work is slow: a transcription can
+// still be in flight when that happens. If the ingest callback resolves the
+// runtime when it LANDS rather than when it was created, A's spoken words get
+// filed under B — B's credentials, B's issue — and A's failure can degrade B's
+// health. The callback is therefore bound to the runtime that created it.
+// ---------------------------------------------------------------------------
+
+describe("voice ingress is bound to the runtime that created it (N1)", () => {
+  it("drops an utterance whose owner was retired before it landed", async () => {
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+
+    // Company A owns the install and arms voice.
+    await host.deliver(COMPANY_A);
+    const retiredIngest = voiceConfig(0).ingestUtterance;
+
+    // An identical configuration for another company advances ownership and
+    // retires A — exactly the path claimOwnership documents.
+    await host.deliver(OTHER_COMPANY);
+    expect(_getRuntimeForTests()?.companyId).toBe(OTHER_COMPANY);
+
+    // Now A's transcription finally comes back.
+    await retiredIngest(utterance("words spoken under company A"));
+
+    expect(commentPosts()).toHaveLength(0);
+    expect(await definition().onHealth()).toMatchObject({ status: "ok" });
+  });
+
+  it("does not degrade the successor's health from the retired owner's utterance", async () => {
+    // No destination configured: were the stale callback to run, it would write
+    // a display-only note onto whoever owns the install now.
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A);
+    const retiredIngest = voiceConfig(0).ingestUtterance;
+
+    await host.deliver(OTHER_COMPANY);
+    await retiredIngest(utterance());
+
+    expect(await definition().onHealth()).toMatchObject({ status: "ok" });
+  });
+
+  it("keeps routing for the owner across an ordinary configuration save", async () => {
+    // The guard must not be so strict that a same-owner redelivery — which
+    // refreshes the runtime in place — stops voice from working.
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A);
+    const ingest = voiceConfig(0).ingestUtterance;
+
+    await host.deliver(COMPANY_A);
+    await ingest(utterance());
+
+    expect(commentPosts()).toHaveLength(1);
+  });
+});
+
+describe("webhook channel resolution is single-flight (N2)", () => {
+  it("asks once when several utterances land together", async () => {
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await Promise.all([
+      voiceConfig().ingestUtterance(utterance("one")),
+      voiceConfig().ingestUtterance(utterance("two")),
+      voiceConfig().ingestUtterance(utterance("three")),
+    ]);
+
+    expect(webhookLookups()).toHaveLength(1);
+    expect(commentPosts()).toHaveLength(3);
+  });
+
+  it("asks once when several utterances land together and the lookup fails", async () => {
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    webhookLookup.ok = false;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await Promise.all([
+      voiceConfig().ingestUtterance(utterance("one")),
+      voiceConfig().ingestUtterance(utterance("two")),
+    ]);
+
+    expect(webhookLookups()).toHaveLength(1);
+    // The cooldown is armed inside the shared lookup, so neither sharer starts another.
+    await voiceConfig().ingestUtterance(utterance("three"));
+    expect(webhookLookups()).toHaveLength(1);
+  });
+
+  it("caches a resolved channel for the life of the session", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+    await host.notifyIssue(COMPANY_A, CHANNEL_ISSUE);
+
+    await voiceConfig().ingestUtterance(utterance("one"));
+    await voiceConfig().ingestUtterance(utterance("two"));
+
+    expect(webhookLookups()).toHaveLength(1);
+    expect(commentPosts()).toHaveLength(2);
+  });
+});
+
+describe("voice health: connectivity and routing are independent (N3)", () => {
+  it("keeps display-only health across a configuration redelivery", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await voiceConfig().ingestUtterance(utterance());
+    expect(await definition().onHealth()).toMatchObject({
+      status: "degraded",
+      details: { issue: "discord-voice-display-only" },
+    });
+
+    // A save proves nothing about whether an utterance now has anywhere to go.
+    await host.deliver();
+    expect(await definition().onHealth()).toMatchObject({
+      status: "degraded",
+      details: { issue: "discord-voice-display-only" },
+    });
+  });
+
+  it("keeps display-only health when the voice connection comes back up", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await voiceConfig().ingestUtterance(utterance());
+    voiceConfig().onAvailabilityChange(true);
+
+    expect(await definition().onHealth()).toMatchObject({
+      status: "degraded",
+      details: { issue: "discord-voice-display-only" },
+    });
+  });
+
+  it("clears display-only health only when an utterance actually routes", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await voiceConfig().ingestUtterance(utterance());
+    expect((await definition().onHealth()).status).toBe("degraded");
+
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    await voiceConfig().ingestUtterance(utterance());
+    expect((await definition().onHealth()).status).toBe("ok");
+  });
+
+  it("reports connectivity while routing is fine, and clears it on reconnection", async () => {
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+    await voiceConfig().ingestUtterance(utterance());
+
+    voiceConfig().onAvailabilityChange(false, "the voice connection did not become ready");
+    expect(await definition().onHealth()).toMatchObject({
+      status: "degraded",
+      details: { issue: "discord-voice-unavailable" },
+    });
+
+    voiceConfig().onAvailabilityChange(true);
+    expect((await definition().onHealth()).status).toBe("ok");
+  });
+
+  it("reports connectivity ahead of routing when both are broken", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await voiceConfig().ingestUtterance(utterance());
+    voiceConfig().onAvailabilityChange(false, "the voice connection did not become ready");
+
+    expect(await definition().onHealth()).toMatchObject({
+      details: { issue: "discord-voice-unavailable" },
+    });
+
+    // With connectivity restored the routing problem is still there.
+    voiceConfig().onAvailabilityChange(true);
+    expect(await definition().onHealth()).toMatchObject({
+      details: { issue: "discord-voice-display-only" },
+    });
+  });
+
+  it("never lets voice clear a degradation that is not voice's", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await voiceConfig().ingestUtterance(utterance());
+    // A bot-token failure outranks anything voice has to say.
+    host.ctx.secrets.resolve.mockRejectedValueOnce(new Error("token gone"));
+    await host.deliver();
+    const degraded = await definition().onHealth();
+    expect(degraded.details).not.toMatchObject({ issue: "discord-voice-display-only" });
+
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    expect((await definition().onHealth()).status).toBe("degraded");
+  });
+});
+
 describe("voice lifecycle in the worker (F2, F5)", () => {
   it("asks the gateway for the voice intent and hands voice its readiness hook", async () => {
     const host = buildHost();
@@ -709,6 +931,34 @@ describe("voice lifecycle in the worker (F2, F5)", () => {
 
     voiceConfig().onAvailabilityChange(true);
     expect((await definition().onHealth()).status).toBe("ok");
+  });
+
+  it("degrades health when configured voice gets a gateway with no voice surface", async () => {
+    // connectGateway returns an inert handle when it cannot get a gateway URL.
+    // Bootstrap then resets health to ok, and voice used to return silently —
+    // leaving the operator reading `ok` while configured voice never armed.
+    gatewayState.inert = true;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    expect(voiceClients).toHaveLength(0);
+    const health = await definition().onHealth();
+    expect(health.status).toBe("degraded");
+    expect(health.details).toMatchObject({ issue: "discord-voice-unavailable" });
+    expect(health.message).toContain("gateway is not connected");
+    expect(health.message).not.toContain("webhook-secret");
+    expect(health.message).not.toContain("deepgram-secret");
+  });
+
+  it("leaves health ok when voice is not configured and the gateway has no voice surface", async () => {
+    gatewayState.inert = true;
+    delete process.env.DEEPGRAM_API_KEY;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    expect(await definition().onHealth()).toMatchObject({ status: "ok" });
   });
 
   it("takes voice down with the plugin", async () => {

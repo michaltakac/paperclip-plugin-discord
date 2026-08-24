@@ -178,6 +178,54 @@ const RUNTIME_NOT_READY_MESSAGE =
 // `multiCompanyConfig` stays unset, so the host also fails a second company's
 // config closed rather than rebinding this worker.
 
+/**
+ * Everything one voice lifecycle owns, in one object bound to one runtime.
+ *
+ * Voice is full of work that finishes later — a transcription in flight, a
+ * webhook lookup in flight, a health note written minutes ago — and all of it
+ * has to agree about which runtime it belongs to. Ownership of an install can
+ * legitimately advance from one company to another (see `claimOwnership`), so
+ * an async completion that consults whatever runtime happens to be current when
+ * it lands can cross the company boundary: an utterance spoken under company A
+ * would be filed under company B, with B's credentials, on B's issue.
+ *
+ * Every async completion therefore consults THIS object, never the module-level
+ * runtime. `active` is the single answer to "does my work still count?", and it
+ * is false from the moment `stopVoice` runs. Because the session hangs off the
+ * runtime, retiring the runtime discards its health notes with it and the
+ * successor starts clean.
+ */
+type VoiceSession = {
+  /** The runtime this session serves. Never re-read from module state. */
+  readonly runtime: DiscordRuntime;
+  /** False from the moment this session is stopped; in-flight work must drop. */
+  active: boolean;
+  /** Tear-down for the voice client, installed before start() is awaited. */
+  stopClient: (() => void) | null;
+  /**
+   * Can voice connect at all? Set when the client reports itself unavailable,
+   * when startup fails, and when the gateway exposes no voice surface.
+   */
+  connectivityNote: string | null;
+  /**
+   * Can a transcribed utterance reach Paperclip? Independent of connectivity —
+   * a perfectly connected voice client with nowhere to send what it hears is a
+   * different problem, and being connected is no evidence that routing works.
+   */
+  routingNote: string | null;
+  /** Single-flight resolution of the text channel behind the voice webhook. */
+  textChannel: {
+    /** Resolved channel id, cached for the life of the session. */
+    channelId: string | null;
+    /** The lookup currently in flight, shared by every concurrent caller. */
+    inFlight: Promise<string | null> | null;
+    /** Epoch ms before which a failed lookup is not attempted again. */
+    retryAfter: number;
+    /** Keeps a persistently failing lookup from logging on every utterance. */
+    logged: boolean;
+  };
+};
+
 type DiscordRuntime = {
   companyId: string;
   config: DiscordConfig;
@@ -191,12 +239,13 @@ type DiscordRuntime = {
   /** Set when the gateway reports a permanent failure, so re-bootstrap reconnects. */
   gatewayFailed: boolean;
   /**
-   * Tear-down for the voice client bound to this runtime's gateway, or null when
-   * voice is disabled or failed to start. Voice is owned by the runtime because
-   * it rides the runtime's gateway socket: retiring the runtime must take voice
-   * with it, or a retired company's connection would keep listening.
+   * This runtime's voice lifecycle, or null when voice is disabled or has not
+   * started. Voice is owned by the runtime because it rides the runtime's
+   * gateway socket and speaks with the runtime's company: retiring the runtime
+   * must take voice with it, or a retired company's connection would keep
+   * listening and its pending work would land under whoever came next.
    */
-  voiceStop: (() => void) | null;
+  voice: VoiceSession | null;
   /**
    * Whether the live connection identified with message intents. Intents are
    * fixed at identify time, so a change here needs a reconnect.
@@ -204,19 +253,6 @@ type DiscordRuntime = {
   listenForMessages: boolean;
   /** Same, for the voice-state intent: voice cannot be added to a live socket. */
   voiceEnabled: boolean;
-  /**
-   * The text channel behind the voice webhook, resolved once and cached.
-   *
-   * A webhook URL does not carry its channel, and the channel is what voice
-   * routes by, so it has to be asked for. Null until the first successful
-   * lookup; a failed lookup simply means voice falls back to the configured
-   * default for that utterance.
-   */
-  voiceTextChannelId: string | null;
-  /** Keeps a persistently failing webhook lookup from logging on every utterance. */
-  voiceWebhookLookupLogged: boolean;
-  /** Epoch ms before which a failed webhook lookup is not retried. */
-  voiceWebhookRetryAfter: number;
   /** The first-install backfill runs at most once per runtime. */
   backfillStarted: boolean;
   defaultGuildId: string | null;
@@ -986,9 +1022,16 @@ async function handleMessageCreate(
  * paths (retire, reconnect, shutdown) whose real work must proceed regardless.
  */
 function stopVoice(ctx: PluginContext, rt: DiscordRuntime, reason: string): void {
-  const stop = rt.voiceStop;
+  const session = rt.voice;
+  if (!session) return;
+  // Invalidate BEFORE tearing anything down. Work already in flight — a
+  // transcription, a webhook lookup — settles after this returns, and `active`
+  // is what tells it not to act on a session that no longer exists.
+  session.active = false;
+  rt.voice = null;
+  const stop = session.stopClient;
+  session.stopClient = null;
   if (!stop) return;
-  rt.voiceStop = null;
   try {
     stop();
     ctx.logger.info("voice: stopped", { reason });
@@ -1230,10 +1273,7 @@ async function bootstrapRuntime(
   rt.digestMode = config.digestMode ?? "off";
   rt.listenForMessages = listenForMessages;
   rt.voiceEnabled = voiceEnabled;
-  rt.voiceTextChannelId = rt.voiceTextChannelId ?? null;
-  rt.voiceWebhookLookupLogged = rt.voiceWebhookLookupLogged ?? false;
-  rt.voiceWebhookRetryAfter = rt.voiceWebhookRetryAfter ?? 0;
-  rt.voiceStop = rt.voiceStop ?? null;
+  rt.voice = rt.voice ?? null;
 
   if (!reuseGateway) {
     // Voice rides this socket's adapter; it cannot outlive the connection it
@@ -1328,6 +1368,10 @@ async function bootstrapRuntime(
   }
 
   await startVoiceIfConfigured(ctx, rt, voiceEnv);
+  // The reset above cleared health wholesale. Voice's own notes are not the
+  // reset's to discard: a destination that was missing a moment ago is still
+  // missing, and a configuration save is no evidence otherwise.
+  refreshVoiceHealth(rt);
 
   ctx.logger.info("Discord plugin runtime started", {
     companyId,
@@ -1346,44 +1390,111 @@ const VOICE_WEBHOOK_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
  * The text channel a voice webhook posts into.
  *
  * Discord's webhook object carries `channel_id`; the URL does not. Voice needs
- * it to find what that channel is currently about, so it is fetched once and
- * cached on the runtime. Every failure path returns null, which costs nothing
- * worse than falling back to the configured default destination.
+ * it to find what that channel is currently about, so it has to be asked for.
+ *
+ * SINGLE-FLIGHT: at most one lookup is ever in flight for a session, and every
+ * concurrent caller shares its result. Several people speaking at once finish
+ * their utterances at once, and without this each of them would issue its own
+ * credential-bearing GET for the same value. A success is cached for the life of
+ * the session; a failure is retried, but not before the cooldown, because a
+ * webhook that is failing is usually revoked or deleted rather than briefly
+ * unwell, and utterances arrive every few seconds while someone is speaking.
+ *
+ * Every failure path returns null, which costs nothing worse than falling back
+ * to the configured default destination.
  *
  * The URL is a credential — it authorizes posting to the channel — so it is
  * never logged, not even on failure.
  */
 async function resolveVoiceTextChannelId(
   ctx: PluginContext,
-  rt: DiscordRuntime,
+  session: VoiceSession,
   webhookUrl: string,
 ): Promise<string | null> {
-  if (rt.voiceTextChannelId) return rt.voiceTextChannelId;
-  // A webhook that is failing is usually failing for a while — revoked, deleted,
-  // its channel gone. Utterances arrive every few seconds while someone is
-  // speaking, so retrying on each one would turn one broken webhook into a
-  // steady stream of requests for a value that is only an optimization.
-  if (Date.now() < rt.voiceWebhookRetryAfter) return null;
-  try {
-    const response = await fetch(webhookUrl, { method: "GET" });
-    if (!response.ok) throw new Error(`webhook lookup returned ${response.status}`);
-    const webhook = (await response.json()) as { channel_id?: unknown };
-    const channelId = normalizeDiscordId(webhook.channel_id);
-    if (!channelId) throw new Error("webhook carries no channel id");
-    rt.voiceTextChannelId = channelId;
-    return channelId;
-  } catch (err) {
-    rt.voiceWebhookRetryAfter = Date.now() + VOICE_WEBHOOK_RETRY_COOLDOWN_MS;
-    if (!rt.voiceWebhookLookupLogged) {
-      rt.voiceWebhookLookupLogged = true;
-      ctx.logger.warn(
-        "voice: could not resolve the transcript channel from its webhook; " +
-          "utterances will use the configured default destination",
-        { error: summarizeError(err, [webhookUrl]) },
-      );
+  const state = session.textChannel;
+  if (state.channelId) return state.channelId;
+  if (state.inFlight) return state.inFlight;
+  if (Date.now() < state.retryAfter) return null;
+
+  // Deliberately cannot reject: concurrent callers share this promise, and one
+  // rejection would surface as an unhandled rejection in every one of them.
+  const lookup = (async (): Promise<string | null> => {
+    try {
+      const response = await fetch(webhookUrl, { method: "GET" });
+      if (!response.ok) throw new Error(`webhook lookup returned ${response.status}`);
+      const webhook = (await response.json()) as { channel_id?: unknown };
+      const channelId = normalizeDiscordId(webhook.channel_id);
+      if (!channelId) throw new Error("webhook carries no channel id");
+      state.channelId = channelId;
+      return channelId;
+    } catch (err) {
+      // Armed inside, so every caller sharing this promise leaves with the
+      // cooldown already in place rather than racing to start another attempt.
+      state.retryAfter = Date.now() + VOICE_WEBHOOK_RETRY_COOLDOWN_MS;
+      if (!state.logged) {
+        state.logged = true;
+        ctx.logger.warn(
+          "voice: could not resolve the transcript channel from its webhook; " +
+            "utterances will use the configured default destination",
+          { error: summarizeError(err, [webhookUrl]) },
+        );
+      }
+      return null;
     }
-    return null;
+  })();
+
+  state.inFlight = lookup;
+  try {
+    return await lookup;
+  } finally {
+    state.inFlight = null;
   }
+}
+
+/** Health issue code for voice that cannot connect. */
+const VOICE_UNAVAILABLE_ISSUE = "discord-voice-unavailable";
+/** Health issue code for voice that runs but has nowhere to send what it hears. */
+const VOICE_DISPLAY_ONLY_ISSUE = "discord-voice-display-only";
+
+/**
+ * Recompute plugin health from the session's two voice concerns.
+ *
+ * Connectivity and routing are independent and neither is evidence about the
+ * other: a voice client that just reconnected still has nowhere to send what it
+ * hears if nothing configured a destination, and a perfectly routed install can
+ * lose its connection. They are therefore tracked separately and only ever
+ * cleared by something that actually proves the concern is resolved — a
+ * connection coming up for connectivity, an utterance actually reaching
+ * Paperclip for routing.
+ *
+ * A non-voice degradation always outranks both: an unresolvable bot token is a
+ * bigger problem than voice, and voice must never overwrite it or clear it.
+ */
+function refreshVoiceHealth(rt: DiscordRuntime): void {
+  const issue = (runtimeHealth.details as { issue?: unknown } | undefined)?.issue;
+  const currentIsVoice =
+    issue === VOICE_UNAVAILABLE_ISSUE || issue === VOICE_DISPLAY_ONLY_ISSUE;
+  if (runtimeHealth.status !== "ok" && !currentIsVoice) return;
+
+  const session = rt.voice;
+  // Connectivity first: with no connection there is nothing to route.
+  if (session?.connectivityNote) {
+    degradeHealth(
+      `[${PLUGIN_ID}] voice is unavailable: ${session.connectivityNote}`,
+      VOICE_UNAVAILABLE_ISSUE,
+      { companyId: rt.companyId },
+    );
+    return;
+  }
+  if (session?.routingNote) {
+    degradeHealth(
+      `[${PLUGIN_ID}] voice transcripts display-only: ${session.routingNote}`,
+      VOICE_DISPLAY_ONLY_ISSUE,
+      { companyId: rt.companyId },
+    );
+    return;
+  }
+  if (currentIsVoice) setRuntimeHealth({ status: "ok" });
 }
 
 /**
@@ -1393,43 +1504,26 @@ async function resolveVoiceTextChannelId(
  * Paperclip. When it does not, "ok" is the wrong answer — but so is a hard
  * failure: the transcript still posts, the room still has its record, and text
  * routing is untouched. Degraded, with a value-free note, is the honest state.
+ *
+ * Only a successfully routed utterance clears this. Nothing else can: neither a
+ * reconnection nor a configuration save is evidence that a destination exists.
  */
 function reportVoiceIngestOutcome(
   ctx: PluginContext,
-  rt: DiscordRuntime,
+  session: VoiceSession,
   outcome: InboundOutcome,
 ): void {
-  if (outcome === "routed") {
-    clearVoiceDegradedHealth();
-    return;
-  }
   if (outcome === "empty") return;
-
-  const message =
-    outcome === "no-destination"
-      ? `[${PLUGIN_ID}] voice transcripts display-only: no destination configured`
-      : `[${PLUGIN_ID}] voice transcripts display-only: the destination rejected the comment`;
-  degradeHealth(message, VOICE_DISPLAY_ONLY_ISSUE, { companyId: rt.companyId });
-  ctx.logger.info("voice: transcript posted to the channel but not ingested", { outcome });
-}
-
-/** Health issue code for a configured-but-unavailable voice subsystem. */
-const VOICE_UNAVAILABLE_ISSUE = "discord-voice-unavailable";
-/** Health issue code for voice that runs but has nowhere to send what it hears. */
-const VOICE_DISPLAY_ONLY_ISSUE = "discord-voice-display-only";
-
-/**
- * Clear a voice-unavailable degradation once voice comes up.
- *
- * Only that one issue is cleared: a gateway or secret failure degraded health
- * for its own reasons and voice recovering says nothing about it.
- */
-function clearVoiceDegradedHealth(): void {
-  if (runtimeHealth.status === "ok") return;
-  const issue = (runtimeHealth.details as { issue?: unknown } | undefined)?.issue;
-  if (issue === VOICE_UNAVAILABLE_ISSUE || issue === VOICE_DISPLAY_ONLY_ISSUE) {
-    setRuntimeHealth({ status: "ok" });
+  session.routingNote =
+    outcome === "routed"
+      ? null
+      : outcome === "no-destination"
+        ? "no destination configured"
+        : "the destination rejected the comment";
+  if (outcome !== "routed") {
+    ctx.logger.info("voice: transcript posted to the channel but not ingested", { outcome });
   }
+  refreshVoiceHealth(session.runtime);
 }
 
 /**
@@ -1449,6 +1543,11 @@ const VOICE_DEPS_INSTALL_HINT =
  * is never reached when the environment does not ask for voice. Nothing in here
  * may propagate — a plugin whose text routing works must keep working when voice
  * does not.
+ *
+ * Everything this creates is bound to ONE session object owned by `rt`. The
+ * callbacks below close over that session and over `rt`, and never read the
+ * module-level runtime: by the time an utterance finishes, the install may
+ * belong to a different company.
  */
 async function startVoiceIfConfigured(
   ctx: PluginContext,
@@ -1462,9 +1561,45 @@ async function startVoiceIfConfigured(
     );
     return;
   }
-  if (rt.voiceStop) return;
+  // A live session owns this runtime's voice; a stopped one is only still here
+  // to carry the health note explaining why, and a new attempt replaces it.
+  if (rt.voice?.active) return;
+
+  const session: VoiceSession = {
+    runtime: rt,
+    active: true,
+    stopClient: null,
+    connectivityNote: null,
+    // A destination problem outlives a restart — nothing about starting the
+    // client again proves an utterance now has somewhere to go.
+    routingNote: rt.voice?.routingNote ?? null,
+    textChannel: { channelId: null, inFlight: null, retryAfter: 0, logged: false },
+  };
+  rt.voice = session;
+
   const gatewayVoice = rt.gateway?.voice;
-  if (!gatewayVoice) return;
+  if (!gatewayVoice) {
+    // The operator configured voice and the gateway came back with no voice
+    // surface at all — no gateway URL, or the connection was never established.
+    // Voice cannot arm, and saying nothing here is what let health read `ok`
+    // while explicitly configured voice was silently absent.
+    session.connectivityNote = "the Discord gateway is not connected";
+    ctx.logger.warn(
+      "voice: configured, but the gateway exposes no voice surface — continuing without voice",
+    );
+    refreshVoiceHealth(rt);
+    return;
+  }
+
+  /**
+   * Does work that started under this session still count?
+   *
+   * Both halves matter. `active` catches a session that was stopped. The runtime
+   * identity check catches ownership advancing to another company: same-owner
+   * redelivery refreshes the existing runtime object in place, so it still
+   * matches, while an advancement builds a new one and this fails.
+   */
+  const stillOurs = (): boolean => session.active && runtime === rt;
 
   try {
     const { VoiceClient, createPluginDiscordAdapter } = await import("./voice/index.js");
@@ -1482,41 +1617,52 @@ async function startVoiceIfConfigured(
       // Voice reaches Paperclip HERE, through the same ingress as a typed reply.
       // The webhook transcript is display only.
       ingestUtterance: async (utterance) => {
-        const current = runtime;
-        if (!current) return;
         // The channel voice routes by is the one the transcript appears in, not
         // the voice channel it was spoken in: that is where notifications land,
         // and so it is the only one that has a target to inherit.
-        const ingested = await ingestInbound(ctx, current, {
-          channelId: await resolveVoiceTextChannelId(ctx, current, voiceEnv.webhookUrl),
+        const channelId = await resolveVoiceTextChannelId(ctx, session, voiceEnv.webhookUrl);
+
+        // Checked after every await and immediately before the write. An
+        // utterance that outlived its owner must not be filed under whoever
+        // owns the install now — it would be spoken content from one company
+        // posted with another company's credentials — and it must not touch the
+        // successor's health either, since it says nothing about the successor.
+        if (!stillOurs()) {
+          ctx.logger.info(
+            "voice: dropping an utterance whose runtime is no longer current",
+            { companyId: rt.companyId },
+          );
+          return;
+        }
+
+        const ingested = await ingestInbound(ctx, rt, {
+          channelId,
           author: `discord:voice:${utterance.userId}`,
           authorLabel: `voice:${utterance.userId}`,
           text: utterance.text,
           threadKey: utterance.threadKey,
         });
-        reportVoiceIngestOutcome(ctx, current, ingested);
+        if (!stillOurs()) return;
+        reportVoiceIngestOutcome(ctx, session, ingested);
       },
       onAvailabilityChange: (available, reason) => {
-        if (available) {
-          clearVoiceDegradedHealth();
-          return;
-        }
-        // `reason` is one of a fixed set of phrases (see VoiceUnavailableReason):
-        // nothing a failure was holding — a URL, a key — can reach health here.
-        degradeHealth(
-          `[${PLUGIN_ID}] voice is unavailable: ${reason ?? "reason not reported"}`,
-          VOICE_UNAVAILABLE_ISSUE,
-          { companyId: rt.companyId },
-        );
+        if (!stillOurs()) return;
+        // Connectivity ONLY. A connection coming up is no evidence that an
+        // utterance has anywhere to go, so it never clears the routing note.
+        session.connectivityNote = available
+          ? null
+          : // `reason` is one of a fixed set of phrases (see VoiceUnavailableReason):
+            // nothing a failure was holding — a URL, a key — can reach health here.
+            (reason ?? "reason not reported");
+        refreshVoiceHealth(rt);
       },
     });
     // Retained BEFORE start() is awaited: a client that fails after construction
     // still has a connection and gateway subscriptions that must be released.
-    rt.voiceStop = () => voiceClient.stop();
+    session.stopClient = () => voiceClient.stop();
     await voiceClient.start();
   } catch (error) {
     stopVoice(ctx, rt, "voice startup failed");
-    rt.voiceStop = null;
     const missingDeps =
       error instanceof Error &&
       (error as NodeJS.ErrnoException).code === "ERR_MODULE_NOT_FOUND";
@@ -1527,15 +1673,14 @@ async function startVoiceIfConfigured(
         : "voice: startup failed (continuing without voice)",
       { error: summarizeError(error) },
     );
-    // The operator explicitly configured voice; saying "ok" while it is dead
-    // is the failure mode that hides this from them entirely.
-    degradeHealth(
-      missingDeps
-        ? `[${PLUGIN_ID}] voice is unavailable: the optional voice dependencies are not installed`
-        : `[${PLUGIN_ID}] voice is unavailable: it could not be started`,
-      VOICE_UNAVAILABLE_ISSUE,
-      { companyId: rt.companyId },
-    );
+    // The operator explicitly configured voice; saying "ok" while it is dead is
+    // the failure mode that hides this from them entirely. `stopVoice` detached
+    // the session; it goes back, inactive, purely to carry the reason.
+    session.connectivityNote = missingDeps
+      ? "the optional voice dependencies are not installed"
+      : "it could not be started";
+    rt.voice = session;
+    refreshVoiceHealth(rt);
   }
 }
 

@@ -350,6 +350,18 @@ export class VoiceClient {
       return;
     }
 
+    // Transcription is the long wait in this pipeline, and stopping the client
+    // does not reach into it. An utterance that was still being transcribed when
+    // this client was retired belongs to a runtime that no longer exists: it must
+    // neither be ingested — the install may since have been handed to another
+    // company — nor displayed in a channel this client has left.
+    if (this.stopped) {
+      this.ctx.logger.info("voice: dropping an utterance transcribed after shutdown", {
+        userId,
+      });
+      return;
+    }
+
     if (transcript.trim().length === 0) return;
 
     // Ingress first, display second: what Paperclip receives must not depend on

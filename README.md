@@ -290,7 +290,22 @@ genuinely conversation-scoped target needs state voice does not have yet.
 A pointer is only ever followed for the company that currently owns the install.
 Ownership can move between installs, and a pointer left behind by a previous
 owner is ignored rather than allowed to file a transcript under the wrong
-company.
+company. The same rule covers slow work: an utterance still being transcribed
+when ownership moves is dropped rather than filed under whoever owns the install
+by the time it finishes.
+
+To find the pointer, the plugin has to know which channel the webhook posts
+into, which a webhook URL does not carry — so it asks Discord for the webhook
+object once. At most one such lookup is in flight at a time and every concurrent
+utterance shares its result; a resolved channel is cached, and a failed lookup is
+retried after a five-minute cooldown. While it is unresolved, utterances use the
+default issue.
+
+Plugin health tracks two independent things about voice: whether it can
+**connect**, and whether what it hears can be **routed**. Neither is evidence
+about the other, so reconnecting does not clear a routing problem and saving the
+configuration does not either — only an utterance actually reaching Paperclip
+does.
 
 The webhook transcript is never the transport. The inbound router refuses bot
 authors and refuses anything that is not a reply to a message this plugin
