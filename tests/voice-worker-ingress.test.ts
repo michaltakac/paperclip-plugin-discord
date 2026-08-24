@@ -303,6 +303,35 @@ describe("inbound ingress — one path for typed replies and voice (F1)", () => 
     expect(commentPosts()).toHaveLength(0);
   });
 
+  it("keeps the escalation-resolved payload the refactor could have changed", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    host.stateStore.set("instance::msg_chan-1_msg-1", {
+      entityId: "esc-1",
+      entityType: "escalation",
+      companyId: COMPANY_A,
+    });
+    host.stateStore.set(`company:${COMPANY_A}:escalation_esc-1`, {
+      escalationId: "esc-1",
+      status: "pending",
+    });
+
+    await gateway().onMessage(typedMessage());
+
+    // `resolvedBy` on the event is the bare username, as it has always been,
+    // while the stored record keeps the attributed `discord:` form.
+    expect(host.ctx.events.emit).toHaveBeenCalledWith(
+      "escalation-resolved",
+      COMPANY_A,
+      expect.objectContaining({ resolvedBy: "alice", responseText: "a typed reply" }),
+    );
+    expect(host.stateStore.get(`company:${COMPANY_A}:escalation_esc-1`)).toMatchObject({
+      resolvedBy: "discord:alice",
+    });
+  });
+
   it("keeps refusing bot authors, webhook posts included", async () => {
     process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
     const host = buildHost();

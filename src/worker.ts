@@ -752,7 +752,14 @@ async function ingestInbound(
   rt: DiscordRuntime,
   input: {
     channelId: string;
+    /** Attributed author, in the `discord:...` form Paperclip stores. */
     author: string;
+    /**
+     * Author as the escalation-resolved event has always reported it: the bare
+     * Discord username for a typed reply. Kept distinct from `author` so this
+     * refactor does not change an event payload other systems already read.
+     */
+    authorLabel: string;
     text: string;
     threadKey: string;
   },
@@ -793,7 +800,7 @@ async function ingestInbound(
       ctx.events.emit("escalation-resolved", mapping.companyId, {
         escalationId: mapping.entityId,
         action: "human_reply",
-        resolvedBy: input.author,
+        resolvedBy: input.authorLabel,
         responseText: text,
       });
     }
@@ -855,6 +862,7 @@ async function handleMessageCreate(
   await ingestInbound(ctx, rt, {
     channelId: message.channel_id,
     author: `discord:${message.author.username}`,
+    authorLabel: message.author.username,
     text: message.content ?? "",
     threadKey: replyThreadKey(refChannelId, refMessageId),
   });
@@ -1309,6 +1317,7 @@ async function startVoiceIfConfigured(
         await ingestInbound(ctx, current, {
           channelId: voiceEnv.voiceChannelId,
           author: `discord:voice:${utterance.userId}`,
+          authorLabel: `voice:${utterance.userId}`,
           text: utterance.text,
           threadKey: utterance.threadKey,
         });
