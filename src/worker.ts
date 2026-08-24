@@ -222,9 +222,9 @@ let runtimeHealth: DiscordRuntimeHealth = {
 };
 
 /**
- * The single ordered critical section every bootstrap source runs inside.
- * Host->worker requests are NOT serialized by the transport, so config deliveries
- * and opportunistic bootstraps must queue against each other here.
+ * The single ordered critical section every configuration delivery runs inside.
+ * Host->worker requests are NOT serialized by the transport, so two deliveries
+ * must queue against each other here.
  */
 let bootstrapQueue: Promise<void> = Promise.resolve();
 /** Last host error from a scoped config read, for the degraded-health message. */
@@ -1223,8 +1223,8 @@ async function identifyDeliveredCompany(
 }
 
 /**
- * Run one bootstrap attempt inside the single ordered critical section shared by
- * every bootstrap source (startup walk, invocation, config delivery).
+ * Run one bootstrap attempt inside the ordered critical section shared by every
+ * configuration delivery — the only thing that bootstraps.
  */
 function queueBootstrap<T>(work: () => Promise<T>): Promise<T> {
   const next = bootstrapQueue.then(work, work);
@@ -2161,9 +2161,9 @@ const plugin = definePlugin({
       return { ok: true, signalsFound: signals.length };
     });
 
-    // Registration is all setup() does. The runtime starts when the host delivers
-    // configuration (>= v2026.817.0 replays it at worker start; a save arrives
-    // this way on every host) or on the first company-scoped invocation.
+    // Registration is all setup() does. The runtime starts only when the host
+    // delivers configuration (>= v2026.817.0 replays it at worker start; a save
+    // arrives this way on every host). Invocations never bootstrap.
     ctx.logger.info("Discord plugin registered; waiting for configuration");
   },
 
@@ -2173,8 +2173,8 @@ const plugin = definePlugin({
       if (!body) return;
 
       const ctx = _pluginCtx;
-      // An interaction always carries a guild/company-agnostic payload, so the
-      // runtime can only be bootstrapped opportunistically here.
+      // An interaction carries no company scope, so this consumes whatever
+      // runtime a configuration delivery has already established, if any.
       const cmdCtx = (await ensureRuntime(ctx))?.cmdCtx ?? null;
 
       if (!ctx || !cmdCtx) {
