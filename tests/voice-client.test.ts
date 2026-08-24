@@ -442,6 +442,35 @@ describe("VoiceClient — a receive-stream failure cannot kill the worker (F3)",
     );
   });
 
+  it("does not display an utterance ingested after the client was stopped (N1)", async () => {
+    // Stopping during the ingress await is as real as stopping during
+    // transcription: posting now puts a transcript into a channel this client
+    // has already left.
+    const { client, connection, relay, ingestUtterance, ctx } = await joinedClient();
+
+    let releaseIngest: () => void = () => {};
+    ingestUtterance.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        releaseIngest = resolve;
+      }),
+    );
+
+    connection.receiver.speaking.emit("start", "user-1");
+    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(1));
+    connection.receiver.streams[0].end(HALF_SECOND_PCM);
+    await vi.waitFor(() => expect(ingestUtterance).toHaveBeenCalledTimes(1));
+
+    client.stop();
+    releaseIngest();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(relay.postTranscript).not.toHaveBeenCalled();
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      "voice: not displaying an utterance ingested after shutdown",
+      expect.objectContaining({ userId: "user-1" }),
+    );
+  });
+
   it("still ingests when the display webhook fails", async () => {
     const { client, connection, relay, ingestUtterance } = await joinedClient();
     relay.postTranscript.mockRejectedValueOnce(new Error("webhook 404"));

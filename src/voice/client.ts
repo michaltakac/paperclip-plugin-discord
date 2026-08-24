@@ -381,6 +381,16 @@ export class VoiceClient {
       });
     }
 
+    // Ingress is an await of its own, and stopping during it is as real as
+    // stopping during transcription. Posting now would put a transcript into a
+    // channel this client has already left.
+    if (this.stopped) {
+      this.ctx.logger.info("voice: not displaying an utterance ingested after shutdown", {
+        userId,
+      });
+      return;
+    }
+
     try {
       await this.relay.postTranscript(transcript, { durationSec });
     } catch (err) {

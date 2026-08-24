@@ -762,7 +762,7 @@ type InboundDestination = {
  * but they mean different things to an operator: one is a configuration gap,
  * the other a destination that exists and refused.
  */
-type InboundOutcome = "routed" | "empty" | "no-destination" | "rejected";
+type InboundOutcome = "routed" | "empty" | "no-destination" | "rejected" | "stale";
 
 /** State key holding what a text channel is currently about, for voice routing. */
 function voiceTargetKey(channelId: string): string {
@@ -873,13 +873,30 @@ async function ingestInbound(
     authorLabel: string;
     text: string;
     threadKey: string;
+    /**
+     * Whether the caller still has standing to write, asked again immediately
+     * before each side effect.
+     *
+     * Voice supplies this; the typed router does not, because a gateway message
+     * is handled synchronously with respect to ownership — there is no window in
+     * which it can go stale. Voice's is a long story: an utterance is
+     * transcribed, then a webhook is resolved, then a destination pointer is
+     * read, and ownership of the install can move at any of those awaits. The
+     * predicate is what makes "still ours?" true at the instant of the write
+     * rather than at some earlier instant that has since passed.
+     */
+    isLive?: () => boolean;
   },
 ): Promise<InboundOutcome> {
   const text = input.text.trim();
   if (!text) return "empty";
+  const isLive = input.isLive ?? (() => true);
 
   const mapping = await resolveInboundDestination(ctx, rt, input.threadKey, input);
   if (!mapping) return "no-destination";
+  // Destination resolution reads the channel pointer, and a retirement can
+  // interleave with that read.
+  if (!isLive()) return "stale";
 
   if (mapping.entityType === "escalation") {
     // Route to escalation response
@@ -897,6 +914,9 @@ async function ingestInbound(
         stateKey: `escalation_${mapping.entityId}`,
       }) as EscalationRecord | null;
     }
+
+    // Two state reads happened above; nothing has been written yet.
+    if (!isLive()) return "stale";
 
     if (record && record.status === "pending") {
       record.status = "resolved";
@@ -926,6 +946,7 @@ async function ingestInbound(
   }
 
   if (mapping.entityType === "issue") {
+    if (!isLive()) return "stale";
     // Route to issue comment
     try {
       await paperclipFetch(
@@ -1020,15 +1041,29 @@ async function handleMessageCreate(
 /**
  * Stop the runtime's voice client, if any. Never throws: voice tear-down runs on
  * paths (retire, reconnect, shutdown) whose real work must proceed regardless.
+ *
+ * `disposition` says what to do with the stopped session:
+ *
+ * - `"tombstone"` leaves it attached, inactive, so the session that replaces it
+ *   can inherit what it learned. Voice going down with its socket says nothing
+ *   about whether utterances had anywhere to go, and a token rotation that
+ *   silently restored `ok` would hide a destination that is still missing.
+ * - `"discard"` detaches it, for teardown with nothing to hand on to: the
+ *   plugin is stopping, or the runtime itself is being retired.
+ *
+ * Either way the session is invalidated first, so work already in flight — a
+ * transcription, a webhook lookup — finds `active` false when it settles.
  */
-function stopVoice(ctx: PluginContext, rt: DiscordRuntime, reason: string): void {
+function stopVoice(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  reason: string,
+  disposition: "tombstone" | "discard" = "tombstone",
+): void {
   const session = rt.voice;
   if (!session) return;
-  // Invalidate BEFORE tearing anything down. Work already in flight — a
-  // transcription, a webhook lookup — settles after this returns, and `active`
-  // is what tells it not to act on a session that no longer exists.
   session.active = false;
-  rt.voice = null;
+  rt.voice = disposition === "tombstone" ? session : null;
   const stop = session.stopClient;
   session.stopClient = null;
   if (!stop) return;
@@ -1048,7 +1083,7 @@ function retireRuntime(ctx: PluginContext, reason: string): void {
     companyId: previous.companyId,
     reason,
   });
-  stopVoice(ctx, previous, reason);
+  stopVoice(ctx, previous, reason, "discard");
   if (previous.gateway) {
     try {
       previous.gateway.close();
@@ -1513,7 +1548,9 @@ function reportVoiceIngestOutcome(
   session: VoiceSession,
   outcome: InboundOutcome,
 ): void {
-  if (outcome === "empty") return;
+  // "stale" means the caller lost standing mid-flight: it wrote nothing, and it
+  // has nothing to say about the health of whoever owns the install now.
+  if (outcome === "empty" || outcome === "stale") return;
   session.routingNote =
     outcome === "routed"
       ? null
@@ -1603,6 +1640,19 @@ async function startVoiceIfConfigured(
 
   try {
     const { VoiceClient, createPluginDiscordAdapter } = await import("./voice/index.js");
+
+    // Loading the voice module is an await like any other, and a permanent
+    // gateway failure or plugin shutdown can tear this session down while it is
+    // pending. Constructing a client now would arm one that nothing can reach:
+    // its stop closure would be installed on a session already detached, so no
+    // later teardown could find it.
+    if (!stillOurs()) {
+      ctx.logger.info("voice: startup abandoned — the session was stopped while loading", {
+        companyId: rt.companyId,
+      });
+      return;
+    }
+
     const voiceClient = new VoiceClient(ctx, {
       guildId: voiceEnv.guildId,
       voiceChannelId: voiceEnv.voiceChannelId,
@@ -1641,6 +1691,9 @@ async function startVoiceIfConfigured(
           authorLabel: `voice:${utterance.userId}`,
           text: utterance.text,
           threadKey: utterance.threadKey,
+          // Carried INTO the ingress: the destination read is another await, and
+          // a check out here cannot speak for what is true on the far side of it.
+          isLive: stillOurs,
         });
         if (!stillOurs()) return;
         reportVoiceIngestOutcome(ctx, session, ingested);
@@ -1662,7 +1715,7 @@ async function startVoiceIfConfigured(
     session.stopClient = () => voiceClient.stop();
     await voiceClient.start();
   } catch (error) {
-    stopVoice(ctx, rt, "voice startup failed");
+    stopVoice(ctx, rt, "voice startup failed", "tombstone");
     const missingDeps =
       error instanceof Error &&
       (error as NodeJS.ErrnoException).code === "ERR_MODULE_NOT_FOUND";
@@ -1674,12 +1727,11 @@ async function startVoiceIfConfigured(
       { error: summarizeError(error) },
     );
     // The operator explicitly configured voice; saying "ok" while it is dead is
-    // the failure mode that hides this from them entirely. `stopVoice` detached
-    // the session; it goes back, inactive, purely to carry the reason.
+    // the failure mode that hides this from them entirely. The tombstone left by
+    // stopVoice is what carries the reason until something replaces it.
     session.connectivityNote = missingDeps
       ? "the optional voice dependencies are not installed"
       : "it could not be started";
-    rt.voice = session;
     refreshVoiceHealth(rt);
   }
 }
@@ -1891,7 +1943,7 @@ const plugin = definePlugin({
     // flag against the live config, and no-ops until the runtime exists.
 
     ctx.events.on("plugin.stopping", async () => {
-      if (runtime) stopVoice(ctx, runtime, "plugin stopping");
+      if (runtime) stopVoice(ctx, runtime, "plugin stopping", "discard");
       runtime?.gateway?.close();
     });
 

@@ -69,26 +69,38 @@ vi.mock("../src/gateway.js", () => ({
 
 const { voiceClients, voiceModule } = vi.hoisted(() => ({
   voiceClients: [] as any[],
-  voiceModule: { startRejectsWith: null as Error | null, importFails: null as Error | null },
+  voiceModule: {
+    startRejectsWith: null as Error | null,
+    importFails: null as Error | null,
+    /** Runs in the lazy-import continuation, before the client is constructed. */
+    onImport: null as ((() => void) | null),
+  },
 }));
 
 vi.mock("../src/voice/index.js", () => ({
   createPluginDiscordAdapter: () => () => ({ sendPayload: () => true, destroy: () => {} }),
-  VoiceClient: class {
-    config: any;
-    stopped = false;
-    constructor(_ctx: any, config: any) {
-      this.config = config;
-      voiceClients.push(this);
-    }
-    async start() {
-      if (voiceModule.startRejectsWith) throw voiceModule.startRejectsWith;
-    }
-    stop() {
-      this.stopped = true;
-    }
+  // A getter, so a test can run something in the window between the dynamic
+  // import resolving and the client being constructed.
+  get VoiceClient() {
+    voiceModule.onImport?.();
+    return MockVoiceClient;
   },
 }));
+
+class MockVoiceClient {
+  config: any;
+  stopped = false;
+  constructor(_ctx: any, config: any) {
+    this.config = config;
+    voiceClients.push(this);
+  }
+  async start() {
+    if (voiceModule.startRejectsWith) throw voiceModule.startRejectsWith;
+  }
+  stop() {
+    this.stopped = true;
+  }
+}
 
 import { _resetRuntimeForTests, _getRuntimeForTests } from "../src/worker.js";
 import { _resetCompanyIdCache } from "../src/company-resolver.js";
@@ -96,6 +108,7 @@ import { _resetCompanyIdCache } from "../src/company-resolver.js";
 const COMPANY_A = "11111111-1111-1111-1111-111111111111";
 const OTHER_COMPANY = "22222222-2222-2222-2222-222222222222";
 const SECRET_ID = "33333333-3333-3333-3333-333333333333";
+const ROTATED_SECRET_ID = "66666666-6666-6666-6666-666666666666";
 const VOICE_ISSUE = "44444444-4444-4444-4444-444444444444";
 const CHANNEL_ISSUE = "55555555-5555-5555-5555-555555555555";
 const TEXT_CHANNEL = "1490608926423646298";
@@ -121,10 +134,17 @@ function buildHost() {
 
   const ctx = {
     config: { get: vi.fn(async (companyId?: string) => (companyId ? storedConfig() : (() => { throw new Error("company context is required"); })())) },
-    secrets: { resolve: vi.fn(async () => "discord-bot-token") },
+    secrets: {
+      resolve: vi.fn(async (ref: any) => `discord-bot-token-${ref?.secretId ?? "default"}`),
+    },
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     state: {
-      get: vi.fn(async (key: any) => stateStore.get(`${key.scopeKind}:${key.scopeId ?? ""}:${key.stateKey}`) ?? null),
+      get: vi.fn(async (key: any) => {
+        if (holdPointerRead && String(key.stateKey).startsWith("voice_target_")) {
+          await holdPointerRead;
+        }
+        return stateStore.get(`${key.scopeKind}:${key.scopeId ?? ""}:${key.stateKey}`) ?? null;
+      }),
       set: vi.fn(async (key: any, value: unknown) => {
         stateStore.set(`${key.scopeKind}:${key.scopeId ?? ""}:${key.stateKey}`, value);
       }),
@@ -219,6 +239,8 @@ function typedMessage(overrides: Record<string, unknown> = {}) {
 
 let fetchMock: ReturnType<typeof vi.fn>;
 let webhookLookup: { ok: boolean; channelId: string };
+/** When set, the voice destination pointer read blocks on it. */
+let holdPointerRead: Promise<void> | null = null;
 let commentPostFails = false;
 
 beforeEach(() => {
@@ -227,8 +249,10 @@ beforeEach(() => {
   gatewayConnects.length = 0;
   voiceClients.length = 0;
   voiceModule.startRejectsWith = null;
+  voiceModule.onImport = null;
   gatewayState.inert = false;
   commentPostFails = false;
+  holdPointerRead = null;
   vi.clearAllMocks();
 
   process.env.DISCORD_VOICE_GUILD_ID = "guild-1";
@@ -704,6 +728,100 @@ describe("voice ingress is bound to the runtime that created it (N1)", () => {
   });
 });
 
+describe("liveness is checked at the write, not before it (N1)", () => {
+  it("writes nothing when retirement lands while the destination is being read", async () => {
+    // The narrow ordering: the webhook lookup has finished and the destination
+    // pointer read is in flight when ownership advances. A check taken before
+    // that read cannot speak for what is true after it.
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A);
+    const ingest = voiceConfig(0).ingestUtterance;
+
+    let releasePointerRead: () => void = () => {};
+    holdPointerRead = new Promise<void>((resolve) => {
+      releasePointerRead = resolve;
+    });
+
+    const pending = ingest(utterance("words spoken under company A"));
+    // Let the utterance reach the held pointer read.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    holdPointerRead = null;
+    await host.deliver(OTHER_COMPANY);
+    expect(_getRuntimeForTests()?.companyId).toBe(OTHER_COMPANY);
+
+    releasePointerRead();
+    await pending;
+
+    expect(commentPosts()).toHaveLength(0);
+  });
+
+  it("still writes when nothing changed while the destination was being read", async () => {
+    // The same ordering without a retirement must route normally, or the guard
+    // is just breaking voice.
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A);
+
+    let releasePointerRead: () => void = () => {};
+    holdPointerRead = new Promise<void>((resolve) => {
+      releasePointerRead = resolve;
+    });
+
+    const pending = voiceConfig(0).ingestUtterance(utterance());
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    releasePointerRead();
+    await pending;
+
+    expect(commentPosts()).toHaveLength(1);
+  });
+
+  it("leaves the successor's health untouched by the retired owner's utterance", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A);
+    const ingest = voiceConfig(0).ingestUtterance;
+
+    await host.deliver(OTHER_COMPANY);
+    await ingest(utterance());
+
+    expect(await definition().onHealth()).toMatchObject({ status: "ok" });
+  });
+});
+
+describe("voice startup abandoned mid-import (N4)", () => {
+  it("constructs no client when the session is torn down while the module loads", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+
+    // A real permanent-gateway-failure callback, firing in the window between
+    // the lazy import resolving and the client being constructed.
+    voiceModule.onImport = () => {
+      gatewayConnects[gatewayConnects.length - 1].options.onPermanentFailure(
+        "gateway permanently down",
+        { issue: "discord-gateway-fatal" },
+      );
+    };
+
+    await host.deliver();
+
+    expect(voiceClients).toHaveLength(0);
+    // Nothing was armed, so nothing is orphaned; health reflects the gateway.
+    expect((await definition().onHealth()).status).toBe("degraded");
+  });
+
+  it("constructs the client normally when nothing tears it down", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    expect(voiceClients).toHaveLength(1);
+  });
+});
+
 describe("webhook channel resolution is single-flight (N2)", () => {
   it("asks once when several utterances land together", async () => {
     process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
@@ -834,6 +952,69 @@ describe("voice health: connectivity and routing are independent (N3)", () => {
     expect(await definition().onHealth()).toMatchObject({
       details: { issue: "discord-voice-display-only" },
     });
+  });
+
+  it("carries the routing note across a same-runtime gateway replacement", async () => {
+    // A token rotation replaces the gateway on the SAME runtime. Voice goes down
+    // with the socket and comes back on the new one — which says nothing about
+    // whether an utterance now has anywhere to go.
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A);
+
+    await voiceConfig().ingestUtterance(utterance());
+    expect(await definition().onHealth()).toMatchObject({
+      details: { issue: "discord-voice-display-only" },
+    });
+
+    await host.deliver(
+      COMPANY_A,
+      storedConfig({
+        discordBotTokenRef: { type: "secret_ref", secretId: ROTATED_SECRET_ID, version: "latest" },
+      }),
+    );
+
+    // A new client was armed on the new socket, and the destination problem is
+    // still reported rather than quietly resolved.
+    expect(voiceClients.length).toBeGreaterThan(1);
+    expect(await definition().onHealth()).toMatchObject({
+      status: "degraded",
+      details: { issue: "discord-voice-display-only" },
+    });
+  });
+
+  it("carries the routing note across recovery from a permanent gateway failure", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A);
+    await voiceConfig().ingestUtterance(utterance());
+
+    gateway().options.onPermanentFailure("gateway permanently down", {
+      issue: "discord-gateway-fatal",
+    });
+    await host.deliver(COMPANY_A);
+
+    expect(await definition().onHealth()).toMatchObject({
+      status: "degraded",
+      details: { issue: "discord-voice-display-only" },
+    });
+  });
+
+  it("leaves no session reachable after the plugin stops", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A);
+    await voiceConfig().ingestUtterance(utterance());
+
+    const stopping = host.ctx.events.on.mock.calls.find(
+      ([name]: any[]) => name === "plugin.stopping",
+    );
+    await stopping[1]();
+
+    // A tombstone is for handing state to a replacement. Shutdown has no
+    // replacement, so nothing is left attached.
+    expect(_getRuntimeForTests()?.voice).toBeNull();
+    expect(voiceClients[0].stopped).toBe(true);
   });
 
   it("never lets voice clear a degradation that is not voice's", async () => {
