@@ -299,3 +299,107 @@ describe("gateway voice surface — sendPayload safety", () => {
     expect(onState).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// F2 — the readiness boundary voice joins on.
+//
+// An op-4 voice-state-update is only deliverable once the socket has
+// identified: before that `sendPayload` refuses it (no OPEN socket) or Discord
+// has no session to attach it to. @discordjs/voice treats a join whose first
+// send was refused as terminal — it does not retry when the adapter becomes
+// usable later — so voice must never join off the back of `connectGateway()`
+// returning. It joins on this boundary, and on nothing else.
+// ---------------------------------------------------------------------------
+
+describe("gateway voice surface — readiness", () => {
+  it("does not signal readiness before the socket has identified", async () => {
+    const { gateway } = await openGateway({ enableVoice: true });
+    const sock = FakeWebSocket.instances[0];
+    const ready = vi.fn();
+
+    gateway.voice!.onGatewayReady(ready);
+    sock.serverOpen();
+    await sock.hello();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // HELLO and IDENTIFY have gone out, but READY has not come back.
+    expect(ready).not.toHaveBeenCalled();
+  });
+
+  it("signals on READY and again on every RESUMED", async () => {
+    const { gateway } = await openGateway({ enableVoice: true });
+    const sock = FakeWebSocket.instances[0];
+    const ready = vi.fn();
+    gateway.voice!.onGatewayReady(ready);
+
+    await handshake(sock);
+    expect(ready).toHaveBeenCalledTimes(1);
+
+    await sock.serverMessage({ op: 0, d: {}, s: 2, t: "RESUMED" });
+    expect(ready).toHaveBeenCalledTimes(2);
+  });
+
+  it("delivers the boundary to a subscriber that arrives after it", async () => {
+    // A reused gateway is already past READY and has no reason to emit another
+    // one; a voice client subscribing then must not wait forever.
+    const { gateway } = await openGateway({ enableVoice: true });
+    const sock = FakeWebSocket.instances[0];
+    await handshake(sock);
+
+    const late = vi.fn();
+    gateway.voice!.onGatewayReady(late);
+    expect(late).not.toHaveBeenCalled(); // never re-entrant with subscribe
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(late).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops treating a closed connection as ready", async () => {
+    const { gateway } = await openGateway({ enableVoice: true });
+    const sock = FakeWebSocket.instances[0];
+    await handshake(sock);
+    sock.serverClose(4000, "closed");
+
+    const late = vi.fn();
+    gateway.voice!.onGatewayReady(late);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(late).not.toHaveBeenCalled();
+  });
+
+  it("unsubscribes cleanly and stops delivering", async () => {
+    const { gateway } = await openGateway({ enableVoice: true });
+    const sock = FakeWebSocket.instances[0];
+    const ready = vi.fn();
+    const off = gateway.voice!.onGatewayReady(ready);
+
+    await handshake(sock);
+    expect(ready).toHaveBeenCalledTimes(1);
+
+    off();
+    await sock.serverMessage({ op: 0, d: {}, s: 2, t: "RESUMED" });
+    expect(ready).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps dispatch alive when a readiness handler throws", async () => {
+    const { ctx, gateway } = await openGateway({ enableVoice: true });
+    const good = vi.fn();
+    gateway.voice!.onGatewayReady(() => {
+      throw new Error("voice handler exploded");
+    });
+    gateway.voice!.onGatewayReady(good);
+
+    const sock = FakeWebSocket.instances[0];
+    await expect(handshake(sock)).resolves.toBeUndefined();
+
+    expect(good).toHaveBeenCalledTimes(1);
+    expect(ctx.logger.error).toHaveBeenCalled();
+  });
+
+  it("does not signal readiness at all when voice is disabled", async () => {
+    const { gateway } = await openGateway();
+    const sock = FakeWebSocket.instances[0];
+    await handshake(sock);
+    expect(gateway.voice).toBeUndefined();
+  });
+});

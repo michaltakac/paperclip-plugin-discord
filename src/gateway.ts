@@ -105,6 +105,7 @@ type InteractionHandler = (interaction: InteractionCreateEvent) => Promise<unkno
 type MessageHandler = (message: MessageCreateEvent) => Promise<void>;
 type VoiceStateUpdateHandler = (event: VoiceStateUpdateEvent) => void;
 type VoiceServerUpdateHandler = (event: VoiceServerUpdateEvent) => void;
+type GatewayReadyHandler = () => void;
 
 /**
  * Voice primitives surfaced on the gateway handle when `enableVoice` is true.
@@ -126,6 +127,22 @@ export interface GatewayVoiceHandle {
   onVoiceStateUpdate(handler: VoiceStateUpdateHandler): () => void;
   /** Subscribe to VOICE_SERVER_UPDATE dispatch events. Returns an unsubscribe function. */
   onVoiceServerUpdate(handler: VoiceServerUpdateHandler): () => void;
+  /**
+   * Subscribe to the gateway's READY/RESUMED boundary. Returns an unsubscribe
+   * function.
+   *
+   * Voice signalling is only deliverable once the socket has identified: an op-4
+   * sent before that is either refused by `sendPayload` (no OPEN socket yet) or
+   * written to a socket Discord has no session for, and @discordjs/voice treats
+   * an undelivered join as terminal rather than retrying when the adapter later
+   * becomes usable. So joining is driven from here and from nowhere else — the
+   * first signal starts voice, and every later one (a resume, or a fresh
+   * identify after a reconnect) rejoins.
+   *
+   * This is a notification, not a control surface: handlers cannot influence
+   * reconnect, which stays owned by `scheduleReconnect` alone.
+   */
+  onGatewayReady(handler: GatewayReadyHandler): () => void;
 }
 
 export interface GatewayHandle {
@@ -300,6 +317,14 @@ export async function connectGateway(
   // across reconnects and outlive the connection it was registered for.
   const voiceStateUpdateHandlers = new Set<VoiceStateUpdateHandler>();
   const voiceServerUpdateHandlers = new Set<VoiceServerUpdateHandler>();
+  const gatewayReadyHandlers = new Set<GatewayReadyHandler>();
+  /**
+   * Whether the current socket has reached READY/RESUMED.
+   *
+   * Kept so a subscriber that arrives after the boundary is not left waiting for
+   * the next one — on a reused connection there may never be a next one.
+   */
+  let gatewayReady = false;
 
   function dispatchVoice<T>(
     handlers: Set<(event: T) => void>,
@@ -368,6 +393,7 @@ export async function connectGateway(
 
   function goPermanentlyDown(message: string, details?: Record<string, unknown>): void {
     permanentlyDown = true;
+    gatewayReady = false;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
@@ -449,6 +475,10 @@ export async function connectGateway(
 
   function connect(url: string, resumeIntent: boolean): void {
     if (closed || permanentlyDown) return;
+
+    // A new socket has not identified yet; the previous one's readiness says
+    // nothing about it.
+    gatewayReady = false;
 
     if (currentSocket) {
       // Defensive: no path should get here with a live socket, but if one
@@ -571,12 +601,16 @@ export async function connectGateway(
             sock.readyAt = Date.now();
             clearConnectTimer(sock);
             ctx.logger.info("Gateway ready", { sessionId, generation: gen });
+            gatewayReady = true;
+            if (enableVoice) dispatchVoice(gatewayReadyHandlers, undefined, "Gateway ready");
           }
 
           if (payload.t === "RESUMED") {
             sock.readyAt = Date.now();
             clearConnectTimer(sock);
             ctx.logger.info("Gateway resumed successfully", { generation: gen });
+            gatewayReady = true;
+            if (enableVoice) dispatchVoice(gatewayReadyHandlers, undefined, "Gateway ready");
           }
 
           if (payload.t === "INTERACTION_CREATE") {
@@ -663,6 +697,7 @@ export async function connectGateway(
       clearConnectTimer(sock);
       if (!isCurrent(sock)) return; // stale socket: never log, never reconnect
       currentSocket = null;
+      gatewayReady = false;
       ctx.logger.info("Gateway WebSocket closed", {
         code: event.code,
         reason: event.reason,
@@ -732,8 +767,10 @@ export async function connectGateway(
   const handle: GatewayHandle = {
     close: () => {
       closed = true;
+      gatewayReady = false;
       voiceStateUpdateHandlers.clear();
       voiceServerUpdateHandlers.clear();
+      gatewayReadyHandlers.clear();
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -762,6 +799,20 @@ export async function connectGateway(
       onVoiceServerUpdate(handler: VoiceServerUpdateHandler): () => void {
         voiceServerUpdateHandlers.add(handler);
         return () => voiceServerUpdateHandlers.delete(handler);
+      },
+      onGatewayReady(handler: GatewayReadyHandler): () => void {
+        gatewayReadyHandlers.add(handler);
+        // Already past the boundary: deliver it now rather than wait for a next
+        // one that a healthy connection has no reason to produce. Deferred by a
+        // microtask so subscribing never runs the handler re-entrantly.
+        if (gatewayReady) {
+          queueMicrotask(() => {
+            if (gatewayReady && gatewayReadyHandlers.has(handler)) {
+              dispatchVoice(new Set([handler]), undefined, "Gateway ready");
+            }
+          });
+        }
+        return () => gatewayReadyHandlers.delete(handler);
       },
     };
   }

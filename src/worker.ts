@@ -202,6 +202,8 @@ type DiscordRuntime = {
    * fixed at identify time, so a change here needs a reconnect.
    */
   listenForMessages: boolean;
+  /** Same, for the voice-state intent: voice cannot be added to a live socket. */
+  voiceEnabled: boolean;
   /** The first-install backfill runs at most once per runtime. */
   backfillStarted: boolean;
   defaultGuildId: string | null;
@@ -677,30 +679,89 @@ function buildEscalationEmbed(payload: EscalationCreatedPayload): {
   return { embeds, components };
 }
 
-/** Reply routing for inbound Discord messages. */
-async function handleMessageCreate(
+/**
+ * Where one piece of inbound text is going.
+ *
+ * A thread key names the conversation the text belongs to and is what decides
+ * the destination. `reply:<channelId>:<messageId>` is a typed reply to a message
+ * this plugin posted; `voice:<guildId>:<channelId>:<sessionId>` is one join of
+ * one voice channel. Adding a source means adding a thread-key form here, not a
+ * second way into Paperclip.
+ */
+type InboundDestination = {
+  entityId: string;
+  entityType: string;
+  companyId: string;
+};
+
+/** Thread key for a typed reply to a message this plugin posted. */
+function replyThreadKey(channelId: string, messageId: string): string {
+  return `reply:${channelId}:${messageId}`;
+}
+
+/**
+ * Resolve a thread key to the Paperclip entity the text belongs to.
+ *
+ * Returns null when the key names nothing this install can route to — an
+ * unmapped reply, or voice with no configured destination. Callers drop the
+ * text rather than guessing.
+ */
+async function resolveInboundDestination(
   ctx: PluginContext,
   rt: DiscordRuntime,
-  message: MessageCreateEvent,
+  threadKey: string,
+): Promise<InboundDestination | null> {
+  if (threadKey.startsWith("reply:")) {
+    const [, channelId, messageId] = threadKey.split(":");
+    if (!channelId || !messageId) return null;
+    const mapping = (await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `msg_${channelId}_${messageId}`,
+    })) as InboundDestination | null;
+    return mapping ?? null;
+  }
+
+  if (threadKey.startsWith("voice:")) {
+    // A spoken utterance is not a reply to anything, so it has no message
+    // mapping to inherit. It goes to the destination the operator configured for
+    // voice, under the company that owns this install — never a company read
+    // from anywhere else (see "Runtime state").
+    const entityId = normalizeDiscordId(process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID);
+    if (!entityId) return null;
+    return { entityId, entityType: "issue", companyId: rt.companyId };
+  }
+
+  return null;
+}
+
+/**
+ * The single inbound ingress: every route by which text from Discord reaches
+ * Paperclip goes through here.
+ *
+ * Both callers — the gateway's MESSAGE_CREATE router and the voice client —
+ * arrive with an already-decided destination and an author string. Voice calls
+ * this DIRECTLY. It does not post a message and hope the router picks it back
+ * up: its webhook transcript is display only, so there is no path by which
+ * anything this plugin writes to Discord can be read back in as input. That is
+ * what makes a transcript loop impossible by construction, and it is why the
+ * router below can keep refusing bot authors and non-replies unconditionally —
+ * no webhook, and no bot, is ever a trusted message source.
+ */
+async function ingestInbound(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  input: {
+    channelId: string;
+    author: string;
+    text: string;
+    threadKey: string;
+  },
 ): Promise<void> {
-  if (rt.config.enableInbound === false) return;
-  // Ignore bot messages
-  if (message.author.bot) return;
-  // Only handle replies to other messages
-  if (!message.message_reference?.message_id) return;
+  const text = input.text.trim();
+  if (!text) return;
 
-  const refChannelId = message.message_reference.channel_id ?? message.channel_id;
-  const refMessageId = message.message_reference.message_id;
-
-  const mapping = await ctx.state.get({
-    scopeKind: "instance",
-    stateKey: `msg_${refChannelId}_${refMessageId}`,
-  }) as { entityId: string; entityType: string; companyId: string } | null;
-
+  const mapping = await resolveInboundDestination(ctx, rt, input.threadKey);
   if (!mapping) return;
-
-  const text = message.content;
-  if (!text?.trim()) return;
 
   if (mapping.entityType === "escalation") {
     // Route to escalation response
@@ -722,7 +783,7 @@ async function handleMessageCreate(
     if (record && record.status === "pending") {
       record.status = "resolved";
       record.resolvedAt = new Date().toISOString();
-      record.resolvedBy = `discord:${message.author.username}`;
+      record.resolvedBy = input.author;
       record.resolution = "human_reply";
       await ctx.state.set(
         { scopeKind: "company", scopeId: escalationCompanyId, stateKey: `escalation_${mapping.entityId}` },
@@ -732,15 +793,16 @@ async function handleMessageCreate(
       ctx.events.emit("escalation-resolved", mapping.companyId, {
         escalationId: mapping.entityId,
         action: "human_reply",
-        resolvedBy: message.author.username,
+        resolvedBy: input.author,
         responseText: text,
       });
     }
 
     await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-    ctx.logger.info("Routed Discord reply to escalation", {
+    ctx.logger.info("Routed inbound Discord text to escalation", {
       escalationId: mapping.entityId,
-      from: message.author.username,
+      from: input.author,
+      threadKey: input.threadKey,
     });
   } else if (mapping.entityType === "issue") {
     // Route to issue comment
@@ -752,20 +814,50 @@ async function handleMessageCreate(
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             body: text,
-            authorUserId: `discord:${message.author.username}`,
+            authorUserId: input.author,
           }),
         },
         rt.paperclipBoardApiKey,
       );
       await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-      ctx.logger.info("Routed Discord reply to issue comment", {
+      ctx.logger.info("Routed inbound Discord text to issue comment", {
         issueId: mapping.entityId,
-        from: message.author.username,
+        from: input.author,
+        threadKey: input.threadKey,
       });
     } catch (err) {
       ctx.logger.error("Failed to route inbound message", { error: String(err) });
     }
   }
+}
+
+/**
+ * Reply routing for inbound Discord messages.
+ *
+ * The trust boundary is here and is unchanged: a bot author is refused, and a
+ * message that is not a reply to something this plugin posted is refused. Voice
+ * does not relax either rule — it does not come through this function at all.
+ */
+async function handleMessageCreate(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  message: MessageCreateEvent,
+): Promise<void> {
+  if (rt.config.enableInbound === false) return;
+  // Ignore bot messages
+  if (message.author.bot) return;
+  // Only handle replies to other messages
+  if (!message.message_reference?.message_id) return;
+
+  const refChannelId = message.message_reference.channel_id ?? message.channel_id;
+  const refMessageId = message.message_reference.message_id;
+
+  await ingestInbound(ctx, rt, {
+    channelId: message.channel_id,
+    author: `discord:${message.author.username}`,
+    text: message.content ?? "",
+    threadKey: replyThreadKey(refChannelId, refMessageId),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -997,6 +1089,7 @@ async function bootstrapRuntime(
   const defaultGuildId = normalizeDiscordId(config.defaultGuildId);
   const listenForMessages = gatewayNeedsMessages(config);
   const voiceEnv = readVoiceEnv();
+  const voiceEnabled = voiceEnv !== null;
 
   // Reuse the live connection only when nothing it identified with has changed.
   // Intents are fixed when the socket identifies (src/gateway.ts), so a change to
@@ -1006,7 +1099,8 @@ async function bootstrapRuntime(
       existing.gateway &&
       !existing.gatewayFailed &&
       existing.token === token &&
-      existing.listenForMessages === listenForMessages,
+      existing.listenForMessages === listenForMessages &&
+      existing.voiceEnabled === voiceEnabled,
   );
 
   // Refresh the EXISTING object rather than replacing it, so a reused gateway's
@@ -1038,6 +1132,7 @@ async function bootstrapRuntime(
   rt.escalationTimeoutMs = (config.escalationTimeoutMinutes || 30) * 60 * 1000;
   rt.digestMode = config.digestMode ?? "off";
   rt.listenForMessages = listenForMessages;
+  rt.voiceEnabled = voiceEnabled;
   rt.voiceStop = rt.voiceStop ?? null;
 
   if (!reuseGateway) {
@@ -1101,7 +1196,7 @@ async function bootstrapRuntime(
         {
           listenForMessages,
           includeMessageContent: listenForMessages,
-          enableVoice: voiceEnv !== null,
+          enableVoice: voiceEnabled,
           // Fatal close codes and identify-budget exhaustion stop the gateway
           // permanently; report it through plugin health instead of running
           // silently without realtime Discord connectivity.
@@ -1142,6 +1237,21 @@ async function bootstrapRuntime(
 
   startBackfillIfEnabled(ctx, rt);
   return rt;
+}
+
+/** Health issue code for a configured-but-unavailable voice subsystem. */
+const VOICE_UNAVAILABLE_ISSUE = "discord-voice-unavailable";
+
+/**
+ * Clear a voice-unavailable degradation once voice comes up.
+ *
+ * Only that one issue is cleared: a gateway or secret failure degraded health
+ * for its own reasons and voice recovering says nothing about it.
+ */
+function clearVoiceDegradedHealth(): void {
+  if (runtimeHealth.status === "ok") return;
+  const issue = (runtimeHealth.details as { issue?: unknown } | undefined)?.issue;
+  if (issue === VOICE_UNAVAILABLE_ISSUE) setRuntimeHealth({ status: "ok" });
 }
 
 /**
@@ -1187,10 +1297,42 @@ async function startVoiceIfConfigured(
       deepgramApiKey: voiceEnv.deepgramApiKey,
       relayUsername: voiceEnv.relayUsername,
       voiceAdapterCreator: createPluginDiscordAdapter(gatewayVoice),
+      // Joining is driven by the gateway's own READY/RESUMED boundary, never by
+      // this call returning: an op-4 sent before the socket has identified is
+      // not deliverable, and @discordjs/voice does not retry one it could not send.
+      onGatewayReady: (handler) => gatewayVoice.onGatewayReady(handler),
+      // Voice reaches Paperclip HERE, through the same ingress as a typed reply.
+      // The webhook transcript is display only.
+      ingestUtterance: async (utterance) => {
+        const current = runtime;
+        if (!current) return;
+        await ingestInbound(ctx, current, {
+          channelId: voiceEnv.voiceChannelId,
+          author: `discord:voice:${utterance.userId}`,
+          text: utterance.text,
+          threadKey: utterance.threadKey,
+        });
+      },
+      onAvailabilityChange: (available, reason) => {
+        if (available) {
+          clearVoiceDegradedHealth();
+          return;
+        }
+        // `reason` is one of a fixed set of phrases (see VoiceUnavailableReason):
+        // nothing a failure was holding — a URL, a key — can reach health here.
+        degradeHealth(
+          `[${PLUGIN_ID}] voice is unavailable: ${reason ?? "reason not reported"}`,
+          VOICE_UNAVAILABLE_ISSUE,
+          { companyId: rt.companyId },
+        );
+      },
     });
+    // Retained BEFORE start() is awaited: a client that fails after construction
+    // still has a connection and gateway subscriptions that must be released.
     rt.voiceStop = () => voiceClient.stop();
     await voiceClient.start();
   } catch (error) {
+    stopVoice(ctx, rt, "voice startup failed");
     rt.voiceStop = null;
     const missingDeps =
       error instanceof Error &&
@@ -1201,6 +1343,15 @@ async function startVoiceIfConfigured(
             `Install them with: ${VOICE_DEPS_INSTALL_HINT}`
         : "voice: startup failed (continuing without voice)",
       { error: summarizeError(error) },
+    );
+    // The operator explicitly configured voice; saying "ok" while it is dead
+    // is the failure mode that hides this from them entirely.
+    degradeHealth(
+      missingDeps
+        ? `[${PLUGIN_ID}] voice is unavailable: the optional voice dependencies are not installed`
+        : `[${PLUGIN_ID}] voice is unavailable: it could not be started`,
+      VOICE_UNAVAILABLE_ISSUE,
+      { companyId: rt.companyId },
     );
   }
 }

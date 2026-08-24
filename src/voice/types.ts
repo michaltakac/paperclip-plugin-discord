@@ -1,15 +1,27 @@
 /**
  * Shared types for the Discord voice client (Phase 1, STT-inbound only).
  *
- * Phase 1 scope: join one voice channel, transcribe what is said there, and
- * post each utterance into a text channel via webhook so the plugin's existing
- * text routing handles it exactly as if the speaker had typed it.
+ * Phase 1 scope: join one voice channel, transcribe what is said there, hand
+ * each utterance to the plugin's inbound ingress, and post the transcript into a
+ * text channel so the room can see what was heard.
  */
 
 import type { DiscordGatewayAdapterCreator } from "@discordjs/voice";
 
 /** Default webhook display name for relayed transcripts. */
 export const DEFAULT_RELAY_USERNAME = "Voice";
+
+/**
+ * Why voice is not currently available, in words safe to put in plugin health.
+ *
+ * Fixed phrases, never interpolated values: this text reaches operators through
+ * the health surface, so it must not be able to carry a webhook URL, an API key,
+ * or anything else a failure happened to be holding.
+ */
+export type VoiceUnavailableReason =
+  | "waiting for the Discord gateway to be ready"
+  | "the voice connection did not become ready"
+  | "the voice channel could not be joined";
 
 export interface VoiceClientConfig {
   /** Discord guild (server) ID. */
@@ -26,6 +38,20 @@ export interface VoiceClientConfig {
   utteranceEndSilenceMs?: number;
   /** Voice connection adapter built over the plugin gateway. See voice/discord-adapter.ts. */
   voiceAdapterCreator: DiscordGatewayAdapterCreator;
+  /**
+   * Subscribe to the gateway's READY/RESUMED boundary; returns an unsubscribe
+   * function. Joining is driven from this and from nothing else — see
+   * `GatewayVoiceHandle.onGatewayReady` in src/gateway.ts.
+   */
+  onGatewayReady: (handler: () => void) => () => void;
+  /**
+   * Hand a finished utterance to the plugin's inbound ingress. This is the ONLY
+   * path by which a spoken utterance reaches Paperclip: the webhook post is
+   * display, not transport.
+   */
+  ingestUtterance: (utterance: UtteranceFinalized) => Promise<void>;
+  /** Voice availability transitions, for the plugin health surface. */
+  onAvailabilityChange?: (available: boolean, reason?: VoiceUnavailableReason) => void;
 }
 
 export interface UtteranceFinalized {
@@ -37,6 +63,8 @@ export interface UtteranceFinalized {
   durationSec: number;
   /** ISO timestamp at finalize. */
   finalizedAt: string;
+  /** Voice session key, stable for one join of one channel. */
+  threadKey: string;
 }
 
 export interface STTAdapter {

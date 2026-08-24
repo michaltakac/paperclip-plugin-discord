@@ -17,4 +17,5 @@ export type {
   TextChannelRelay,
   UtteranceFinalized,
   VoiceClientConfig,
+  VoiceUnavailableReason,
 } from "./types.js";

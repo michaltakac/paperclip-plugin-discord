@@ -154,9 +154,11 @@ This is that plugin.
 
 ### Voice transcription (optional, opt-in)
 - The bot joins one voice channel and transcribes what is said there (inbound only — it never speaks)
-- Each utterance is posted into a text channel by webhook, so existing reply routing handles it as if it had been typed
+- Each utterance goes to Paperclip through the same inbound ingress a typed reply uses, and is also posted into a text channel by webhook so the room can see what was heard
+- The webhook post is **display only** — nothing reads it back, so a transcript cannot loop and no webhook is ever a trusted input source
 - Speech-to-text via Deepgram; end-of-utterance is 800 ms of silence
 - Off unless four environment variables are set, and it rides the plugin's existing gateway connection — no second Discord connection
+- Joins on the gateway's own READY/RESUMED boundary, and rejoins there after a reconnect
 - Requires [optional dependencies](#voice-transcription-setup) that are **not** installed by default
 
 ## Install
@@ -253,13 +255,29 @@ Then set these environment variables on the plugin worker:
 | `DISCORD_VOICE_WEBHOOK_URL` | Yes | Webhook URL of the text channel transcripts are posted to |
 | `DEEPGRAM_API_KEY` | Yes | Deepgram API key for streaming speech-to-text |
 | `DISCORD_VOICE_USERNAME` | No | Webhook display name for transcripts (default: `Voice`) |
+| `DISCORD_VOICE_DEFAULT_ISSUE_ID` | No | Paperclip issue that spoken utterances are commented on. Without it, transcripts are posted to the channel but nothing is sent to Paperclip. |
 
-If any of the four required variables is missing, voice initializes nothing and the plugin runs exactly as before. Voice startup and shutdown are both wrapped: a voice failure is logged and never crashes the plugin or interrupts text routing.
+If any of the four required variables is missing, voice initializes nothing and the plugin runs exactly as before. Voice startup and shutdown are both wrapped: a voice failure is logged, reported through plugin health, and never crashes the plugin or interrupts text routing.
+
+### Where a spoken utterance goes
+
+A voice utterance is not a reply to anything, so it has no message to inherit a
+destination from. It is commented on the issue named by
+`DISCORD_VOICE_DEFAULT_ISSUE_ID`, under the company that owns this install, by
+the same ingress and the same API call a typed reply uses. With that variable
+unset, voice still transcribes and still posts to the text channel — it simply
+sends nothing to Paperclip.
+
+The webhook transcript is never the transport. The inbound router refuses bot
+authors and refuses anything that is not a reply to a message this plugin
+posted, and voice does not ask it to make an exception: it calls the ingress
+directly. Nothing this plugin writes to Discord can be read back in as input.
 
 Notes:
 
 - The bot joins **self-muted and un-deafened** — Phase 1 listens, it does not speak.
-- Enabling voice adds the `GUILD_VOICE_STATES` intent to the gateway IDENTIFY.
+- Enabling voice adds the `GUILD_VOICE_STATES` intent to the gateway IDENTIFY. Intents are fixed when the socket identifies, so turning voice on or off reconnects the gateway.
+- Voice joins when the gateway reaches READY or RESUMED, never before: a voice-state update sent to a socket that has not identified is not deliverable, and a join that could not be sent is not retried by `@discordjs/voice`.
 - Transcripts are posted with `allowed_mentions: { parse: [] }`. Speech recognition will happily render "at everyone" as `@everyone`, so no transcript can ever ping anyone — the text is preserved verbatim, but Discord resolves no mentions in it.
 - Audio is sent to Deepgram for transcription. Tell the people in the channel.
 

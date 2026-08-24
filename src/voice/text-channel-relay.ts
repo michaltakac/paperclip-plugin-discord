@@ -1,7 +1,12 @@
 /**
- * POST utterance transcripts to a Discord text channel via webhook, so the
- * plugin's existing inbound routing picks them up exactly as if the speaker
- * had typed them.
+ * POST utterance transcripts to a Discord text channel via webhook, so the room
+ * can see what the bot heard.
+ *
+ * This is DISPLAY ONLY. The utterance reaches Paperclip through the plugin's
+ * inbound ingress (see src/voice/client.ts), not through this post, and nothing
+ * reads this post back: the inbound router refuses bot authors and non-replies,
+ * and voice does not ask it for an exception. A transcript therefore cannot loop
+ * back in as input, and no webhook is a trusted message source.
  *
  * Discord webhook payload shape: { content, username, allowed_mentions }.
  * Success = 204 No Content. We retry once on 5xx; hard-fail 4xx.
