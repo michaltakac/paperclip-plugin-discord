@@ -549,6 +549,22 @@ describe("voice destination — channel target, then configured default", () => 
     expect(String(commentPosts()[0][0])).toContain(`/api/issues/${VOICE_ISSUE}/comments`);
   });
 
+  it("does not re-ask a webhook that just failed on every utterance", async () => {
+    webhookLookup.ok = false;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await voiceConfig().ingestUtterance(utterance());
+    await voiceConfig().ingestUtterance(utterance());
+    await voiceConfig().ingestUtterance(utterance());
+
+    const lookups = fetchMock.mock.calls.filter(([url]: any[]) =>
+      String(url).includes("/api/webhooks/"),
+    );
+    expect(lookups).toHaveLength(1);
+  });
+
   it("never puts the webhook URL in the log when its lookup fails", async () => {
     webhookLookup.ok = false;
     const host = buildHost();

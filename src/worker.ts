@@ -215,6 +215,8 @@ type DiscordRuntime = {
   voiceTextChannelId: string | null;
   /** Keeps a persistently failing webhook lookup from logging on every utterance. */
   voiceWebhookLookupLogged: boolean;
+  /** Epoch ms before which a failed webhook lookup is not retried. */
+  voiceWebhookRetryAfter: number;
   /** The first-install backfill runs at most once per runtime. */
   backfillStarted: boolean;
   defaultGuildId: string | null;
@@ -1230,6 +1232,7 @@ async function bootstrapRuntime(
   rt.voiceEnabled = voiceEnabled;
   rt.voiceTextChannelId = rt.voiceTextChannelId ?? null;
   rt.voiceWebhookLookupLogged = rt.voiceWebhookLookupLogged ?? false;
+  rt.voiceWebhookRetryAfter = rt.voiceWebhookRetryAfter ?? 0;
   rt.voiceStop = rt.voiceStop ?? null;
 
   if (!reuseGateway) {
@@ -1336,6 +1339,9 @@ async function bootstrapRuntime(
   return rt;
 }
 
+/** How long a failed webhook lookup is left alone before it is tried again. */
+const VOICE_WEBHOOK_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
+
 /**
  * The text channel a voice webhook posts into.
  *
@@ -1353,6 +1359,11 @@ async function resolveVoiceTextChannelId(
   webhookUrl: string,
 ): Promise<string | null> {
   if (rt.voiceTextChannelId) return rt.voiceTextChannelId;
+  // A webhook that is failing is usually failing for a while — revoked, deleted,
+  // its channel gone. Utterances arrive every few seconds while someone is
+  // speaking, so retrying on each one would turn one broken webhook into a
+  // steady stream of requests for a value that is only an optimization.
+  if (Date.now() < rt.voiceWebhookRetryAfter) return null;
   try {
     const response = await fetch(webhookUrl, { method: "GET" });
     if (!response.ok) throw new Error(`webhook lookup returned ${response.status}`);
@@ -1362,6 +1373,7 @@ async function resolveVoiceTextChannelId(
     rt.voiceTextChannelId = channelId;
     return channelId;
   } catch (err) {
+    rt.voiceWebhookRetryAfter = Date.now() + VOICE_WEBHOOK_RETRY_COOLDOWN_MS;
     if (!rt.voiceWebhookLookupLogged) {
       rt.voiceWebhookLookupLogged = true;
       ctx.logger.warn(
