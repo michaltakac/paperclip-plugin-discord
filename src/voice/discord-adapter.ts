@@ -1,21 +1,17 @@
 /**
- * Bridge between paperclip-plugin-discord's gateway primitives and
- * @discordjs/voice's expected DiscordGatewayAdapter interface.
+ * Bridge between the plugin's gateway primitives and @discordjs/voice's
+ * expected DiscordGatewayAdapter interface.
  *
- * @discordjs/voice doesn't ship with a built-in gateway — every consumer
- * has to provide an adapter that knows how to (a) send op-4 voice-state
- * updates and (b) deliver VOICE_STATE_UPDATE + VOICE_SERVER_UPDATE events.
- * Our `gateway.ts` exposes exactly those primitives via the `voice` handle
- * (introduced in Phase 1 Task 1.5).
+ * @discordjs/voice does not ship a gateway — every consumer provides an adapter
+ * that knows how to (a) send op-4 voice-state updates and (b) deliver
+ * VOICE_STATE_UPDATE + VOICE_SERVER_UPDATE events. `gateway.ts` exposes exactly
+ * those two primitives through its `voice` handle, so voice rides the plugin's
+ * single existing gateway socket: no second Discord connection is opened, and
+ * the adapter never sees the socket or the reconnect state behind the handle.
  *
- * See ../../../docs/superpowers/research/2026-05-28-plugin-sdk-voice-feasibility.md
- * (in the MRTek repo) for the architecture rationale.
- *
- * Known Phase 1 limitation: handlers registered via gatewayVoice.onVoice*Update
- * cannot currently be removed (gateway handler list is append-only). For Phase 1
- * the bot joins one voice channel for the plugin's lifetime, so this doesn't
- * leak. If we add reconnect/rejoin semantics in later phases, add a remove-handler
- * primitive to gateway.ts and call it from destroy() below.
+ * `sendPayload` returns false when there is no OPEN socket (mid-reconnect, or
+ * after shutdown). That boolean is part of the @discordjs/voice contract — it
+ * treats a false return as "not delivered" and retries the signalling itself.
  */
 
 import type { DiscordGatewayAdapterCreator } from "@discordjs/voice";
@@ -33,20 +29,26 @@ export function createPluginDiscordAdapter(
     type StateData = Parameters<typeof methods.onVoiceStateUpdate>[0];
     type ServerData = Parameters<typeof methods.onVoiceServerUpdate>[0];
 
-    gatewayVoice.onVoiceStateUpdate((event) => {
-      methods.onVoiceStateUpdate(event as unknown as StateData);
-    });
-    gatewayVoice.onVoiceServerUpdate((event) => {
-      methods.onVoiceServerUpdate(event as unknown as ServerData);
-    });
+    const unsubscribes: Array<() => void> = [
+      gatewayVoice.onVoiceStateUpdate((event) => {
+        methods.onVoiceStateUpdate(event as unknown as StateData);
+      }),
+      gatewayVoice.onVoiceServerUpdate((event) => {
+        methods.onVoiceServerUpdate(event as unknown as ServerData);
+      }),
+    ];
 
     return {
       sendPayload(payload) {
         return gatewayVoice.sendPayload(payload);
       },
       destroy() {
-        // No-op: handler list is append-only in gateway.ts today.
-        // See file header note.
+        // Detach this connection's handlers from the gateway. Without this a
+        // destroyed voice connection would keep receiving dispatch for the
+        // lifetime of the plugin.
+        while (unsubscribes.length > 0) {
+          unsubscribes.pop()!();
+        }
       },
     };
   };

@@ -152,6 +152,13 @@ This is that plugin.
 - Exponential backoff with max 5 consecutive failures before long backoff (60s)
 - Handles op 7 (reconnect), op 9 (invalid session), heartbeat ACK timeouts
 
+### Voice transcription (optional, opt-in)
+- The bot joins one voice channel and transcribes what is said there (inbound only — it never speaks)
+- Each utterance is posted into a text channel by webhook, so existing reply routing handles it as if it had been typed
+- Speech-to-text via Deepgram; end-of-utterance is 800 ms of silence
+- Off unless four environment variables are set, and it rides the plugin's existing gateway connection — no second Discord connection
+- Requires [optional dependencies](#voice-transcription-setup) that are **not** installed by default
+
 ## Install
 
 ```bash
@@ -166,39 +173,8 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -d '{"packageName":"paperclip-plugin-discord"}'
 ```
 
-### Host compatibility
-
-**Fully supported on Paperclip v2026.817.0 and newer.** The plugin works on v2026.720.0 and
-v2026.722.0 with the limitation described below; older hosts cannot resolve its secrets at all.
-
-Since [paperclipai/paperclip#9557](https://github.com/paperclipai/paperclip/pull/9557) the plugin SDK
-requires a company scope for every `config.get` and `secrets.resolve` call. The plugin is built
-around that rule: it registers its handlers at startup and starts its Discord runtime once the host
-hands it a company's configuration.
-
-| Host version | What happens |
-|---|---|
-| < v2026.720.0 | The secret-ref kill switch blocks token resolution. The plugin activates and health reports `degraded` with the host's error, but no Discord connection is made. Upgrade the host. |
-| v2026.720.0 / v2026.722.0 | The plugin activates, and the configuration applies when you save it — **but it is not retained across a worker restart.** Those hosts only send a plugin its configuration on an operator save; replaying stored configuration at worker start arrived in v2026.817.0. After every restart of the plugin worker, open the plugin settings and save again. |
-| >= v2026.817.0 | The runtime starts at worker boot: the host replays each company's stored configuration to the worker ([#10092](https://github.com/paperclipai/paperclip/pull/10092), [#10113](https://github.com/paperclipai/paperclip/pull/10113)). Nothing to do after an install beyond saving the configuration once. |
-
-While no configuration has reached the plugin, plugin health reports `degraded` and names the reason
-the host gave. That is the first place to look if Discord stays silent after an install.
-
-On v2026.720.0 and v2026.722.0 the SDK also delivers configuration without telling the plugin which
-company it belongs to. The plugin identifies the company itself, by probing from inside that delivery
-— only the delivered company answers — so a multi-company install still binds to the right one.
-
-This plugin is single-tenant: one install serves one company — the company whose configuration the
-host delivers first. On v2026.817.0 and newer the host replays stored configuration when the worker
-starts, so that happens by itself; on v2026.720.0 / v2026.722.0 save the configuration once after
-installing and again after a worker restart. Configuration for any other company is logged and
-ignored rather than rebinding the plugin or disturbing the running one, and running Discord for a
-second company needs a second plugin install.
-
-If the owning company's configuration cannot start the plugin (for example its bot-token secret was
-deleted), health reports `degraded` naming that company and the plugin waits for a corrected
-configuration rather than binding somewhere else.
+> **Note — `paperclipai` master, post [#5429](https://github.com/paperclipai/paperclip/pull/5429) (2026-05-09):**
+> The new Secrets Manager ships with a temporary kill switch on plugin secret-ref UUIDs while a company-scoped `plugin_config` follow-up lands. If you're running paperclipai master, plugin activation will fail with `Plugin secret references are disabled until company-scoped plugin config lands`, and `POST /api/plugins/:id/config` returns HTTP 422 for configs containing secret-ref UUIDs (e.g. `discordBotTokenRef`). This is intentional fail-closed mitigation (PAP-2394 — see the [upstream plan doc](https://github.com/paperclipai/paperclip/blob/master/doc/plans/2026-04-26-plugin-secret-ref-company-scope.md)). Until the follow-up lands, pin to the last paperclipai release before #5429. This callout will be removed once secret-ref resolution is restored.
 
 ## Troubleshooting: confirm your Paperclip host
 
@@ -210,22 +186,19 @@ Before filing a bug, confirm which Paperclip host this plugin is actually talkin
 2. Add a bot to the application and copy the bot token
 3. Enable the MESSAGE CONTENT privileged intent (for intelligence scanning)
 4. Invite the bot to your server with `applications.commands` and `bot` scopes
-5. In Paperclip, store the bot token as a **company secret**, by either:
+5. In Paperclip, create a **company secret** holding your bot token, by either:
 
-   - **UI:** Open any agent's **Configuration → Environment variables**, enter a name (e.g. `discord-bot-token`) and the bot token as the value, then click **Create / Seal**. The secret is created at the **company level** (not bound to that agent — despite the agent-context UI) and is available to any plugin in that company.
-   - **REST API:** `POST /api/companies/{companyId}/secrets` with body `{"name": "discord-bot-token", "value": "<your-bot-token>", "provider": "local_encrypted"}`.
-6. Open **Plugin Settings for Discord Bot** and select that secret in **Discord Bot Token** using the
-   secret picker. Do not type or paste a secret UUID into the field: the picker stores a secret
-   binding (`{"type": "secret_ref", "secretId": "..."}`), which is the shape the host accepts. Set
-   your guild ID and default channel ID in the same form, then save.
-7. Saving the configuration is what starts the Discord runtime on a v2026.720.0 / v2026.722.0 host.
-   Check plugin health afterwards: `ok` means the bot is connected, `degraded` carries the reason.
+   - **UI:** Open any agent's **Configuration → Environment variables**, enter a name (e.g. `discord-bot-token`) and the bot token as the value, then click **Create / Seal**. The secret is created at the **company level** (not bound to that agent — despite the agent-context UI) and the returned UUID can be used from any plugin in the company.
+   - **REST API:** `POST /api/companies/{companyId}/secrets` with body `{"name": "discord-bot-token", "value": "<your-bot-token>", "provider": "local_encrypted"}`. The response contains the secret's UUID.
+
+   Copy the resulting secret UUID — you'll paste it into `discordBotTokenRef` in the next step.
+6. Configure the plugin with the secret UUID in `discordBotTokenRef`, your guild ID, and channel ID
 
 ## Configuration
 
 | Setting | Required | Description |
 |---------|----------|-------------|
-| `discordBotTokenRef` | Yes | Your Discord bot token, selected with the secret picker |
+| `discordBotTokenRef` | Yes | Secret reference to your Discord bot token |
 | `defaultChannelId` | Yes | Default channel for notifications |
 | `defaultGuildId` | No | Server ID (required for slash commands and intelligence) |
 | `approvalsChannelId` | No | Dedicated channel for approvals |
@@ -256,6 +229,41 @@ Before filing a bug, confirm which Paperclip host this plugin is actually talkin
 | `enableProactiveSuggestions` | No | Allow agents to register watch conditions (default: false) |
 | `proactiveScanIntervalMinutes` | No | How often to check watches (default: 15, min: 5, max: 60) |
 | `paperclipBaseUrl` | No | Base URL for Paperclip API calls (default: http://localhost:3100) |
+
+### Voice transcription setup
+
+Voice is opt-in and adds no weight to a normal install. Its dependencies are declared as **optional peer dependencies**, so `npm install paperclip-plugin-discord` does not pull them in and nothing about the text path changes.
+
+To enable it, install the voice dependencies alongside the plugin:
+
+```bash
+npm install @discordjs/voice prism-media opusscript@0.0.8 libsodium-wrappers ws
+```
+
+> `opusscript` is pinned to `0.0.8` on purpose: `prism-media@1.3.5` declares it as `peerOptional opusscript@^0.0.8`, so installing a newer `opusscript` fails with `ERESOLVE`.
+
+`prism-media` ships no Opus codec of its own — it needs one of `opusscript`, `@discordjs/opus`, `node-opus` or `ffmpeg-static` to decode incoming audio. `opusscript` is pure JavaScript and needs no native build, so it is the recommended default; `@discordjs/opus` is faster but compiles a native module. Without an engine the plugin refuses to start voice and logs the install command, rather than joining the channel and silently transcribing nothing.
+
+Then set these environment variables on the plugin worker:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DISCORD_VOICE_GUILD_ID` | Yes | Guild (server) ID containing the voice channel |
+| `DISCORD_VOICE_CHANNEL_ID` | Yes | Voice channel the bot joins on startup |
+| `DISCORD_VOICE_WEBHOOK_URL` | Yes | Webhook URL of the text channel transcripts are posted to |
+| `DEEPGRAM_API_KEY` | Yes | Deepgram API key for streaming speech-to-text |
+| `DISCORD_VOICE_USERNAME` | No | Webhook display name for transcripts (default: `Voice`) |
+
+If any of the four required variables is missing, voice initializes nothing and the plugin runs exactly as before. Voice startup and shutdown are both wrapped: a voice failure is logged and never crashes the plugin or interrupts text routing.
+
+Notes:
+
+- The bot joins **self-muted and un-deafened** — Phase 1 listens, it does not speak.
+- Enabling voice adds the `GUILD_VOICE_STATES` intent to the gateway IDENTIFY.
+- Transcripts are posted with `allowed_mentions: { parse: [] }`. Speech recognition will happily render "at everyone" as `@everyone`, so no transcript can ever ping anyone — the text is preserved verbatim, but Discord resolves no mentions in it.
+- Audio is sent to Deepgram for transcription. Tell the people in the channel.
+
+Not in this phase: text-to-speech output, per-agent voices, cost guards.
 
 ## Agent tools
 
@@ -294,34 +302,16 @@ Brings the Discord plugin to full parity with the Telegram plugin across 14 feat
 
 ## Migration
 
-### Company-scoped configuration and secret bindings
-
-Secret-reference fields (`discordBotTokenRef`, `paperclipBoardApiKeyRef`) now accept the secret
-binding written by the settings secret picker, which is what current hosts store and validate.
-A configuration saved earlier as a bare secret UUID keeps working: current hosts reject a plain
-string outright, so the plugin converts it to the picker's binding before resolving it. A host at
-v2026.720.0 or newer will not let you save a bare UUID, so re-select the secret with the picker the
-next time you edit the plugin configuration.
-
-Only a secret UUID is accepted in those fields. If the raw bot token is typed in directly, the
-plugin refuses to use it and reports `degraded` health naming the field — it never sends the value
-anywhere, and never writes it to health or logs.
-
-If the plugin used to activate and now reports `degraded` health after an upgrade, read the health
-message: it carries the host's own error. The usual cause is that no configuration has been delivered
-yet on a v2026.720.0 / v2026.722.0 host — save the plugin configuration once.
-
 ### v0.2.1
 
-The `discordBotTokenRef` field takes a Paperclip secret reference, not the raw token value. If you
-previously entered a raw bot token in the field:
+The `discordBotTokenRef` field now requires a Paperclip secret reference (a UUID), not the raw token value. If you previously entered a raw bot token in the field, follow these steps to migrate:
 
-1. Store the bot token as a company secret using one of the paths in the [Setup](#setup) section above (UI or REST API).
-2. Open **Plugin Settings for Discord Bot** and select that secret in "Discord Bot Token" with the secret picker.
-3. Save.
+1. Create a company secret holding your bot token using one of the paths in the [Setup](#setup) section above (UI or REST API).
+2. Copy the returned secret UUID.
+3. Open **Plugin Settings for Discord Bot** and paste the UUID into "Discord Bot Token".
+4. Save and restart the plugin.
 
-A raw token in that field is refused by the plugin, which reports `degraded` health naming the
-field rather than sending the value to the host.
+The plugin will fail to activate if a raw token (non-UUID) is entered in the field.
 
 ## Development
 
@@ -332,7 +322,7 @@ pnpm test
 pnpm build
 ```
 
-540 tests covering company-scoped configuration bootstrap across host generations, formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
+323 tests covering formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
 
 ## Contributing
 

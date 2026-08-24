@@ -1,23 +1,30 @@
 /**
- * Shared types for the war-room voice client (Phase 1, STT-inbound only).
- * Spec: ../../../docs/superpowers/specs/2026-05-28-war-room-voice-design.md
- *       (in the MRTek mrt-ai-agent-platform repo)
+ * Shared types for the Discord voice client (Phase 1, STT-inbound only).
+ *
+ * Phase 1 scope: join one voice channel, transcribe what is said there, and
+ * post each utterance into a text channel via webhook so the plugin's existing
+ * text routing handles it exactly as if the speaker had typed it.
  */
 
 import type { DiscordGatewayAdapterCreator } from "@discordjs/voice";
+
+/** Default webhook display name for relayed transcripts. */
+export const DEFAULT_RELAY_USERNAME = "Voice";
 
 export interface VoiceClientConfig {
   /** Discord guild (server) ID. */
   guildId: string;
   /** Discord voice channel ID to join on startup. */
   voiceChannelId: string;
-  /** Webhook URL in the war-room text channel for posting transcripts as @Michael (voice). */
+  /** Webhook URL of the text channel that transcripts are posted to. */
   textChannelWebhookUrl: string;
   /** Deepgram API key. */
   deepgramApiKey: string;
+  /** Webhook display name for relayed transcripts. Default: "Voice". */
+  relayUsername?: string;
   /** Silence duration (ms) that ends an utterance. Default: 800. */
   utteranceEndSilenceMs?: number;
-  /** Voice connection adapter from the host SDK / gateway. See voice/discord-adapter.ts. */
+  /** Voice connection adapter built over the plugin gateway. See voice/discord-adapter.ts. */
   voiceAdapterCreator: DiscordGatewayAdapterCreator;
 }
 
@@ -41,6 +48,6 @@ export interface STTAdapter {
 }
 
 export interface TextChannelRelay {
-  /** Post a transcript message to the war-room text channel as @Michael (voice). */
+  /** Post a transcript message to the configured text channel. */
   postTranscript(text: string, metadata: { durationSec: number }): Promise<void>;
 }

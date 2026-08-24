@@ -1,20 +1,35 @@
 /**
- * POST utterance transcripts to the war-room text channel via webhook,
- * surfaced as "Michael (voice)" so existing Alfred routing picks them up
- * exactly as if Michael had typed them.
+ * POST utterance transcripts to a Discord text channel via webhook, so the
+ * plugin's existing inbound routing picks them up exactly as if the speaker
+ * had typed them.
  *
- * Discord webhook payload shape: { content, username, avatar_url? }.
+ * Discord webhook payload shape: { content, username, allowed_mentions }.
  * Success = 204 No Content. We retry once on 5xx; hard-fail 4xx.
  *
- * Empty / whitespace-only transcripts are skipped — nothing meaningful
- * was said and posting noise to the war-room defeats the audit-trail value.
+ * Mention safety: transcripts are machine-generated from whatever was said out
+ * loud, so `content` is fully attacker-influenced text. Speech recognition will
+ * happily render "at everyone" as "@everyone", and a webhook with default
+ * mention parsing would then mass-ping the channel. `allowed_mentions` is
+ * pinned to an empty parse list on every request: the literal text still shows,
+ * but nothing in a transcript can ever ping anyone. This is deliberately not a
+ * string-rewriting filter — Discord's own allow-list is the authoritative
+ * control, and it cannot be evaded by unicode tricks or novel mention syntax.
+ *
+ * Empty / whitespace-only transcripts are skipped — nothing meaningful was
+ * said and posting noise to the channel defeats the audit-trail value.
  */
 
-import type { TextChannelRelay } from "./types.js";
+import { DEFAULT_RELAY_USERNAME, type TextChannelRelay } from "./types.js";
+
+/**
+ * Discord's allowed_mentions object with an empty parse list: no @everyone,
+ * no @here, no role pings, no user pings — regardless of message content.
+ */
+export const NO_MENTIONS = { parse: [] as string[] };
 
 interface RelayConfig {
   webhookUrl: string;
-  /** Display username for the webhook posts. Default: "Michael (voice)" */
+  /** Display username for the webhook posts. Default: "Voice". */
   username?: string;
 }
 
@@ -24,7 +39,7 @@ export class WebhookTextChannelRelay implements TextChannelRelay {
 
   constructor(cfg: RelayConfig) {
     this.webhookUrl = cfg.webhookUrl;
-    this.username = cfg.username ?? "Michael (voice)";
+    this.username = cfg.username ?? DEFAULT_RELAY_USERNAME;
   }
 
   async postTranscript(
@@ -40,6 +55,7 @@ export class WebhookTextChannelRelay implements TextChannelRelay {
     const body = JSON.stringify({
       content: trimmed,
       username: this.username,
+      allowed_mentions: NO_MENTIONS,
     });
 
     // First attempt

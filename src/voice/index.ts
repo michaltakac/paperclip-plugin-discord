@@ -1,13 +1,17 @@
 /**
- * Public exports for the war-room voice subsystem.
- * See ../../docs/superpowers/specs/2026-05-28-war-room-voice-design.md
- * (in the MRTek repo).
+ * Public exports for the voice subsystem (Phase 1, STT inbound only).
+ *
+ * Everything here depends on the optional voice peer dependencies
+ * (@discordjs/voice, prism-media, opusscript, libsodium-wrappers, ws). Import
+ * this module dynamically, inside a try/catch, so a plugin installed without
+ * them keeps working — see src/worker.ts.
  */
 
-export { WarRoomVoiceClient } from "./client.js";
+export { VoiceClient, assertOpusEngineAvailable, VOICE_DEPS_INSTALL_HINT } from "./client.js";
 export { createPluginDiscordAdapter } from "./discord-adapter.js";
 export { DeepgramSTTAdapter } from "./stt-deepgram.js";
-export { WebhookTextChannelRelay } from "./text-channel-relay.js";
+export { WebhookTextChannelRelay, NO_MENTIONS } from "./text-channel-relay.js";
+export { DEFAULT_RELAY_USERNAME } from "./types.js";
 export type {
   STTAdapter,
   TextChannelRelay,

@@ -1145,6 +1145,15 @@ async function bootstrapRuntime(
 }
 
 /**
+ * The install command every "voice deps are missing" log line ends with.
+ *
+ * Duplicated from `src/voice/client.ts` on purpose: importing it from there
+ * would be a static import of the module whose entire point is to load lazily.
+ */
+const VOICE_DEPS_INSTALL_HINT =
+  "npm install @discordjs/voice prism-media opusscript@0.0.8 libsodium-wrappers ws";
+
+/**
  * Start the voice client for this runtime, if voice is configured.
  *
  * Voice is optional in the strongest sense: its peer dependencies may not be
@@ -1160,8 +1169,8 @@ async function startVoiceIfConfigured(
 ): Promise<void> {
   if (!voiceEnv) {
     ctx.logger.info(
-      "voice: disabled — set WAR_ROOM_GUILD_ID, WAR_ROOM_VOICE_CHANNEL_ID, " +
-        "MICHAEL_VOICE_WEBHOOK_URL and DEEPGRAM_API_KEY to enable it",
+      "voice: disabled — set DISCORD_VOICE_GUILD_ID, DISCORD_VOICE_CHANNEL_ID, " +
+        "DISCORD_VOICE_WEBHOOK_URL and DEEPGRAM_API_KEY to enable it",
     );
     return;
   }
@@ -1170,21 +1179,29 @@ async function startVoiceIfConfigured(
   if (!gatewayVoice) return;
 
   try {
-    const { WarRoomVoiceClient, createPluginDiscordAdapter } = await import("./voice/index.js");
-    const voiceClient = new WarRoomVoiceClient(ctx, {
+    const { VoiceClient, createPluginDiscordAdapter } = await import("./voice/index.js");
+    const voiceClient = new VoiceClient(ctx, {
       guildId: voiceEnv.guildId,
       voiceChannelId: voiceEnv.voiceChannelId,
       textChannelWebhookUrl: voiceEnv.webhookUrl,
       deepgramApiKey: voiceEnv.deepgramApiKey,
+      relayUsername: voiceEnv.relayUsername,
       voiceAdapterCreator: createPluginDiscordAdapter(gatewayVoice),
     });
     rt.voiceStop = () => voiceClient.stop();
     await voiceClient.start();
   } catch (error) {
     rt.voiceStop = null;
-    ctx.logger.error("voice: startup failed (continuing without voice)", {
-      error: summarizeError(error),
-    });
+    const missingDeps =
+      error instanceof Error &&
+      (error as NodeJS.ErrnoException).code === "ERR_MODULE_NOT_FOUND";
+    ctx.logger.error(
+      missingDeps
+        ? "voice: optional voice dependencies are not installed — continuing without voice. " +
+            `Install them with: ${VOICE_DEPS_INSTALL_HINT}`
+        : "voice: startup failed (continuing without voice)",
+      { error: summarizeError(error) },
+    );
   }
 }
 
@@ -1201,10 +1218,11 @@ function readVoiceEnv(): {
   voiceChannelId: string;
   webhookUrl: string;
   deepgramApiKey: string;
+  relayUsername: string | undefined;
 } | null {
-  const guildId = process.env.WAR_ROOM_GUILD_ID;
-  const voiceChannelId = process.env.WAR_ROOM_VOICE_CHANNEL_ID;
-  const webhookUrl = process.env.MICHAEL_VOICE_WEBHOOK_URL;
+  const guildId = process.env.DISCORD_VOICE_GUILD_ID;
+  const voiceChannelId = process.env.DISCORD_VOICE_CHANNEL_ID;
+  const webhookUrl = process.env.DISCORD_VOICE_WEBHOOK_URL;
   const deepgramApiKey = process.env.DEEPGRAM_API_KEY;
   if (!guildId || !voiceChannelId || !webhookUrl || !deepgramApiKey) return null;
   return {
@@ -1212,6 +1230,7 @@ function readVoiceEnv(): {
     voiceChannelId,
     webhookUrl,
     deepgramApiKey,
+    relayUsername: process.env.DISCORD_VOICE_USERNAME,
   };
 }
 

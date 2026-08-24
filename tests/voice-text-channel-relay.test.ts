@@ -3,6 +3,12 @@ import { WebhookTextChannelRelay } from "../src/voice/text-channel-relay.js";
 
 const FAKE_URL = "https://discord.example/api/webhooks/123/abc";
 
+function lastBody(): any {
+  const calls = (global.fetch as ReturnType<typeof vi.fn>).mock.calls;
+  const [, opts] = calls[calls.length - 1] as [string, RequestInit];
+  return JSON.parse(opts.body as string);
+}
+
 describe("WebhookTextChannelRelay", () => {
   beforeEach(() => {
     vi.spyOn(global, "fetch");
@@ -12,21 +18,21 @@ describe("WebhookTextChannelRelay", () => {
     vi.restoreAllMocks();
   });
 
-  it("POSTs to the webhook URL with content and Michael (voice) username", async () => {
+  it("POSTs to the webhook URL with content and the default username", async () => {
     (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
       new Response(null, { status: 204 }),
     );
 
     const relay = new WebhookTextChannelRelay({ webhookUrl: FAKE_URL });
-    await relay.postTranscript("hello alfred", { durationSec: 1.2 });
+    await relay.postTranscript("hello there", { durationSec: 1.2 });
 
     expect(global.fetch).toHaveBeenCalledOnce();
     const calls = (global.fetch as ReturnType<typeof vi.fn>).mock.calls;
-    const [url, opts] = calls[0] as [string, RequestInit];
+    const [url] = calls[0] as [string, RequestInit];
     expect(url).toBe(FAKE_URL);
-    const body = JSON.parse(opts.body as string);
-    expect(body.content).toBe("hello alfred");
-    expect(body.username).toBe("Michael (voice)");
+    const body = lastBody();
+    expect(body.content).toBe("hello there");
+    expect(body.username).toBe("Voice");
   });
 
   it("retries once on 5xx then succeeds", async () => {
@@ -79,9 +85,64 @@ describe("WebhookTextChannelRelay", () => {
     });
     await relay.postTranscript("hi", { durationSec: 0.5 });
 
+    expect(lastBody().username).toBe("Custom Name");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mention safety. A transcript is machine-generated from whatever someone said
+// out loud, so it is fully attacker-influenced text arriving on a webhook that
+// posts into a channel. Without allowed_mentions, saying "at everyone" is
+// enough to mass-ping the server.
+//
+// The control is Discord's own allow-list, not string filtering: the literal
+// text is preserved, and nothing in it can resolve to a ping.
+// ---------------------------------------------------------------------------
+describe("WebhookTextChannelRelay — mention safety", () => {
+  beforeEach(() => {
+    vi.spyOn(global, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("always sends allowed_mentions with an empty parse list", async () => {
+    const relay = new WebhookTextChannelRelay({ webhookUrl: FAKE_URL });
+    await relay.postTranscript("perfectly ordinary sentence", { durationSec: 1 });
+
+    expect(lastBody().allowed_mentions).toEqual({ parse: [] });
+  });
+
+  it.each([
+    ["@everyone", "@everyone ship it now"],
+    ["@here", "hey @here can someone look"],
+    ["role mention", "ping <@&123456789012345678> about this"],
+    ["user mention", "ask <@987654321098765432> to review"],
+    ["mixed", "<@&1> @everyone @here <@2> all at once"],
+  ])("neutralises %s without rewriting the transcript", async (_label, transcript) => {
+    const relay = new WebhookTextChannelRelay({ webhookUrl: FAKE_URL });
+    await relay.postTranscript(transcript, { durationSec: 2 });
+
+    const body = lastBody();
+    // Text is preserved verbatim — the operator still sees what was said.
+    expect(body.content).toBe(transcript);
+    // But Discord is told to resolve no mentions at all.
+    expect(body.allowed_mentions).toEqual({ parse: [] });
+  });
+
+  it("keeps allowed_mentions on the 5xx retry attempt", async () => {
+    (global.fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(new Response(null, { status: 500 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+    const relay = new WebhookTextChannelRelay({ webhookUrl: FAKE_URL });
+    await relay.postTranscript("@everyone retry", { durationSec: 1 });
+
     const calls = (global.fetch as ReturnType<typeof vi.fn>).mock.calls;
-    const [, opts] = calls[0] as [string, RequestInit];
-    const body = JSON.parse(opts.body as string);
-    expect(body.username).toBe("Custom Name");
+    expect(calls).toHaveLength(2);
+    for (const [, opts] of calls as Array<[string, RequestInit]>) {
+      expect(JSON.parse(opts.body as string).allowed_mentions).toEqual({ parse: [] });
+    }
   });
 });
