@@ -12,14 +12,20 @@ import manifest from "../src/manifest.js";
 
 // Capture the setup function from definePlugin by mocking the SDK.
 // vi.hoisted ensures the variable exists before the mock factory runs.
-const { capturedSetups } = vi.hoisted(() => {
-  const capturedSetups: Array<(ctx: any) => Promise<void>> = [];
-  return { capturedSetups };
+const { capturedDefinitions } = vi.hoisted(() => {
+  const capturedDefinitions: any[] = [];
+  return { capturedDefinitions };
 });
+
+/** The company whose scoped config the mock host delivers. */
+const TEST_COMPANY_ID = "company-1";
+/** What a host >= v2026.720.0 throws for an unscoped `ctx.config.get()`. */
+const UNSCOPED_CONFIG_ERROR =
+  'not allowed to perform "config.get": company context is required';
 
 vi.mock("@paperclipai/plugin-sdk", () => ({
   definePlugin: (def: any) => {
-    if (def.setup) capturedSetups.push(def.setup);
+    if (def.setup) capturedDefinitions.push(def);
     return Object.freeze({ definition: def });
   },
   runWorker: vi.fn(),
@@ -27,13 +33,26 @@ vi.mock("@paperclipai/plugin-sdk", () => ({
 
 // Now import the worker — the mock intercepts definePlugin.
 // This must be a static import so vitest hoists the mock before it.
-import "../src/worker.js";
+import { _resetRuntimeForTests } from "../src/worker.js";
 
+/**
+ * Mount the plugin the way a governed host does (paperclipai/paperclip#9557).
+ *
+ * setup() runs with NO company scope — an unscoped `ctx.config.get()` throws
+ * there — so the runtime is bootstrapped by the host's company-scoped config
+ * delivery (`onConfigChanged`) immediately afterwards, exactly as a 2026.720/722
+ * host does at worker startup.
+ */
 function getSetup(): (ctx: any) => Promise<void> {
-  if (capturedSetups.length === 0) {
+  if (capturedDefinitions.length === 0) {
     throw new Error("setup() was not captured — definePlugin mock may not be active");
   }
-  return capturedSetups[capturedSetups.length - 1];
+  const definition = capturedDefinitions[capturedDefinitions.length - 1];
+  return async (ctx: any) => {
+    _resetRuntimeForTests();
+    await definition.setup(ctx);
+    await definition.onConfigChanged?.(ctx.__testConfig ?? {}, { companyId: TEST_COMPANY_ID });
+  };
 }
 
 /**
@@ -43,7 +62,7 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
   const registeredJobs = new Map<string, Function>();
 
   const defaultConfig: Record<string, unknown> = {
-    discordBotTokenRef: "fake-secret-ref",
+    discordBotTokenRef: { type: "secret_ref", secretId: "33333333-3333-3333-3333-333333333333" },
     defaultGuildId: "",
     defaultChannelId: "ch-1",
     approvalsChannelId: "",
@@ -78,7 +97,14 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
   };
 
   const ctx = {
-    config: { get: vi.fn().mockResolvedValue(defaultConfig) },
+    // A governed host denies an unscoped read; the plugin must never make one.
+    config: {
+      get: vi.fn().mockImplementation(async (companyId?: string) => {
+        if (!companyId) throw new Error(UNSCOPED_CONFIG_ERROR);
+        return defaultConfig;
+      }),
+    },
+    __testConfig: defaultConfig,
     secrets: { resolve: vi.fn().mockResolvedValue("fake-bot-token") },
     logger: {
       info: vi.fn(),
@@ -194,28 +220,30 @@ describe("job handler registration vs manifest", () => {
     );
   });
 
-  it("logs at debug level (not info) when digest mode is off", async () => {
+  // Registration-time logging can no longer report the digest mode: setup() runs
+  // outside any company scope and cannot read config (paperclipai/paperclip#9557),
+  // so the mode is only known when the job actually runs.
+  it("registers the digest job without announcing a mode it cannot know yet", async () => {
     const { ctx } = await runSetup({ digestMode: "off" });
 
-    // The info log should NOT contain "Daily digest job registered"
     const infoMessages = ctx.logger.info.mock.calls.map((c: any[]) => c[0]);
     expect(infoMessages).not.toContainEqual(
       expect.stringContaining("Daily digest job registered"),
     );
-
-    // Instead, the debug log should contain the registration message
     expect(ctx.logger.debug).toHaveBeenCalledWith(
       expect.stringContaining("Daily digest job registered"),
-      expect.objectContaining({ mode: "off" }),
     );
   });
 
-  it("logs at info level when digest mode is active", async () => {
-    const { ctx } = await runSetup({ digestMode: "daily" });
+  it("reads the digest mode from the live config when the job runs", async () => {
+    const { registeredJobs, ctx } = await runSetup({ digestMode: "daily" });
 
-    expect(ctx.logger.info).toHaveBeenCalledWith(
-      "Daily digest job registered",
-      expect.objectContaining({ mode: "daily" }),
+    const handler = registeredJobs.get("discord-daily-digest")!;
+    await handler();
+
+    // Mode "daily" means no early return for an off digest.
+    expect(ctx.logger.debug).not.toHaveBeenCalledWith(
+      expect.stringContaining("digest mode is off"),
     );
   });
 

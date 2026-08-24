@@ -15,26 +15,45 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 //   - approval.rejected edits the original message to show ❌ Rejected
 // ---------------------------------------------------------------------------
 
-const { capturedSetups } = vi.hoisted(() => {
-  const capturedSetups: Array<(ctx: any) => Promise<void>> = [];
-  return { capturedSetups };
+const { capturedDefinitions } = vi.hoisted(() => {
+  const capturedDefinitions: any[] = [];
+  return { capturedDefinitions };
 });
+
+/** The company whose scoped config the mock host delivers. */
+const TEST_COMPANY_ID = "company-1";
+/** What a host >= v2026.720.0 throws for an unscoped `ctx.config.get()`. */
+const UNSCOPED_CONFIG_ERROR =
+  'not allowed to perform "config.get": company context is required';
 
 vi.mock("@paperclipai/plugin-sdk", () => ({
   definePlugin: (def: any) => {
-    if (def.setup) capturedSetups.push(def.setup);
+    if (def.setup) capturedDefinitions.push(def);
     return Object.freeze({ definition: def });
   },
   runWorker: vi.fn(),
 }));
 
-import "../src/worker.js";
+import { _resetRuntimeForTests } from "../src/worker.js";
 
+/**
+ * Mount the plugin the way a governed host does (paperclipai/paperclip#9557).
+ *
+ * setup() runs with NO company scope — an unscoped `ctx.config.get()` throws
+ * there — so the runtime is bootstrapped by the host's company-scoped config
+ * delivery (`onConfigChanged`) immediately afterwards, exactly as a 2026.720/722
+ * host does at worker startup.
+ */
 function getSetup(): (ctx: any) => Promise<void> {
-  if (capturedSetups.length === 0) {
+  if (capturedDefinitions.length === 0) {
     throw new Error("setup() was not captured — definePlugin mock may not be active");
   }
-  return capturedSetups[capturedSetups.length - 1];
+  const definition = capturedDefinitions[capturedDefinitions.length - 1];
+  return async (ctx: any) => {
+    _resetRuntimeForTests();
+    await definition.setup(ctx);
+    await definition.onConfigChanged?.(ctx.__testConfig ?? {}, { companyId: TEST_COMPANY_ID });
+  };
 }
 
 function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
@@ -44,7 +63,7 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
   const editedMessages: Array<{ channelId: string; messageId: string; body: any }> = [];
 
   const defaultConfig: Record<string, unknown> = {
-    discordBotTokenRef: "fake-secret-ref",
+    discordBotTokenRef: { type: "secret_ref", secretId: "33333333-3333-3333-3333-333333333333" },
     defaultGuildId: "",
     defaultChannelId: "ch-approvals",
     approvalsChannelId: "ch-approvals",
@@ -96,7 +115,14 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
   });
 
   const ctx = {
-    config: { get: vi.fn().mockResolvedValue(defaultConfig) },
+    // A governed host denies an unscoped read; the plugin must never make one.
+    config: {
+      get: vi.fn().mockImplementation(async (companyId?: string) => {
+        if (!companyId) throw new Error(UNSCOPED_CONFIG_ERROR);
+        return defaultConfig;
+      }),
+    },
+    __testConfig: defaultConfig,
     secrets: { resolve: vi.fn().mockResolvedValue("fake-bot-token") },
     logger: {
       info: vi.fn(),

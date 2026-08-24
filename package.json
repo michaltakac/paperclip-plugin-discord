@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "dev": "tsc --watch",
     "test": "vitest run",
+    "version": "node scripts/sync-plugin-version.mjs && git add src/constants.ts",
     "prepublishOnly": "npm run build",
     "prepare": "npm run build"
   },
@@ -20,8 +21,8 @@
     "@paperclipai/shared": "*"
   },
   "devDependencies": {
-    "@paperclipai/plugin-sdk": "^2026.707.0",
-    "@paperclipai/shared": "^2026.707.0",
+    "@paperclipai/plugin-sdk": "^2026.817.0",
+    "@paperclipai/shared": "^2026.817.0",
     "typescript": "^5.7.0",
     "vitest": "^3.2.6"
   },

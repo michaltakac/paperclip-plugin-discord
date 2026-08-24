@@ -47,21 +47,29 @@ const manifest: PaperclipPluginManifestV1 = {
   instanceConfigSchema: {
     type: "object",
     properties: {
+      // Secret-ref fields accept BOTH shapes the host can store:
+      //   - the object binding written by the settings secret picker
+      //     ({ type: "secret_ref", secretId, version }), and
+      //   - a bare secret UUID string from an older hand-written config.
+      // The schema must therefore declare `["string", "object"]`: the host
+      // validates config with Ajv against this schema BEFORE its secret-ref
+      // extractor runs, and that extractor rejects bare UUID strings on every
+      // `format: "secret-ref"` path — a `type: "string"` field can no longer be
+      // saved at all. No `default` either: an empty-string default fails the
+      // same extractor on a fresh install.
       discordBotTokenRef: {
-        type: "string",
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Discord Bot Token (secret reference)",
         description:
-          "Secret UUID for your Discord Bot token. Create the secret in Settings → Secrets, then paste its UUID here.",
-        default: DEFAULT_CONFIG.discordBotTokenRef,
+          "Your Discord bot token, stored as a secret. Create the secret in Settings → Secrets, then pick it here with the secret picker.",
       },
       paperclipBoardApiKeyRef: {
-        type: "string",
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Paperclip Board API Key (secret reference)",
         description:
-          "Optional. Secret UUID for a Paperclip board API key. Required when Paperclip is deployed in `authenticated` mode so that plugin-originated calls (approve/reject buttons, workflow steps, inbound reply routing) can satisfy server-side board-auth checks. Create a board API key in Settings → API Keys, store it as a secret, then paste the secret UUID here. Leave blank for `local_trusted` deployments.",
-        default: DEFAULT_CONFIG.paperclipBoardApiKeyRef,
+          "Optional. A Paperclip board API key, stored as a secret. Required when Paperclip is deployed in `authenticated` mode so that plugin-originated calls (approve/reject buttons, workflow steps, inbound reply routing) can satisfy server-side board-auth checks. Create a board API key in Settings → API Keys, store it as a secret, then pick it here. Leave empty for `local_trusted` deployments.",
       },
       defaultGuildId: {
         type: "string",
