@@ -3,6 +3,14 @@ import { type DiscordEmbed, respondToInteraction } from "./discord-api.js";
 import { COLORS, METRIC_NAMES } from "./constants.js";
 import { humanizeStatus } from "./formatters.js";
 import { withRetry, throwOnRetryableStatus } from "./retry.js";
+import {
+  beginLink,
+  getLink,
+  removeLink,
+  resolveActorUserId,
+  savePending,
+  tryCompleteLink,
+} from "./identity.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
 import { resolveCompanyId } from "./company-resolver.js";
@@ -34,7 +42,7 @@ interface InteractionData {
 interface Interaction {
   type: number;
   data?: InteractionData;
-  member?: { user: { username: string } };
+  member?: { user: { id?: string; username: string } };
   channel_id?: string;
 }
 
@@ -162,6 +170,24 @@ export const SLASH_COMMANDS = [
             required: false,
           },
         ],
+      },
+      {
+        name: "link",
+        description: "Connect your Discord account to your Paperclip account",
+        type: 1,
+        options: [],
+      },
+      {
+        name: "unlink",
+        description: "Disconnect your Discord account from Paperclip",
+        type: 1,
+        options: [],
+      },
+      {
+        name: "whoami",
+        description: "Show which Paperclip account your Discord user is linked to",
+        type: 1,
+        options: [],
       },
       {
         name: "connect-channel",
@@ -345,7 +371,13 @@ export async function handleInteraction(
   }
 
   if (interaction.type === 3 && interaction.data) {
-    return handleButtonClick(ctx, interaction.data, interaction.member?.user.username, cmdCtx);
+    return handleButtonClick(
+      ctx,
+      interaction.data,
+      interaction.member?.user.username,
+      cmdCtx,
+      interaction.member?.user.id,
+    );
   }
 
   if (interaction.type === 4 && interaction.data) {
@@ -362,7 +394,7 @@ export async function handleInteraction(
 async function handleSlashCommand(
   ctx: PluginContext,
   data: InteractionData,
-  member?: { user: { username: string } },
+  member?: { user: { id?: string; username: string } },
   cmdCtx?: CommandContext,
   interactionChannelId?: string,
 ): Promise<unknown> {
@@ -415,6 +447,7 @@ async function handleSlashCommand(
         member?.user.username,
         baseUrl,
         cmdCtx?.paperclipBoardApiKey,
+        member?.user.id,
       );
     case "budget":
       return handleBudget(ctx, getOption(subcommand.options ?? [], "agent"), companyId);
@@ -430,6 +463,12 @@ async function handleSlashCommand(
       return handleHelp();
     case "connect":
       return handleConnect(ctx, getOption(subcommand.options ?? [], "company"));
+    case "link":
+      return handleIdentityLink(ctx, member, cmdCtx);
+    case "unlink":
+      return handleIdentityUnlink(ctx, member);
+    case "whoami":
+      return handleIdentityWhoami(ctx, member, cmdCtx);
     case "connect-channel":
       return handleConnectChannel(ctx, getOption(subcommand.options ?? [], "project") ?? "", interactionChannelId);
     case "digest":
@@ -572,6 +611,7 @@ async function handleApprove(
   username?: string,
   baseUrl?: string,
   apiKey?: string,
+  discordUserId?: string,
 ): Promise<unknown> {
   if (!approvalId) {
     return respondToInteraction({
@@ -587,7 +627,7 @@ async function handleApprove(
       const r = await paperclipFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decidedByUserId: `discord:${username ?? "unknown"}` }),
+        body: JSON.stringify({ decidedByUserId: await resolveActorUserId(ctx, discordUserId, username) }),
       }, apiKey);
       throwOnRetryableStatus(r);
       return r;
@@ -1159,9 +1199,13 @@ async function handleButtonClick(
   data: InteractionData,
   username?: string,
   cmdCtx?: CommandContext,
+  discordUserId?: string,
 ): Promise<unknown> {
   const customId = data.custom_id ?? data.name;
   const actor = username ?? "Discord user";
+  // The Paperclip user id to record against this action. Falls back to the
+  // historical `discord:{username}` string when the user has not linked.
+  const actorUserId = await resolveActorUserId(ctx, discordUserId, username);
   const base = cmdCtx?.baseUrl ?? "http://localhost:3100";
   const token = cmdCtx?.token ?? "";
   const apiKey = cmdCtx?.paperclipBoardApiKey ?? "";
@@ -1175,7 +1219,7 @@ async function handleButtonClick(
         const r = await paperclipFetch(`${base}/api/approvals/${approvalId}/approve`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ decidedByUserId: `discord:${actor}` }),
+          body: JSON.stringify({ decidedByUserId: actorUserId }),
         }, apiKey);
         throwOnRetryableStatus(r);
         return r;
@@ -1226,7 +1270,7 @@ async function handleButtonClick(
         const r = await paperclipFetch(`${base}/api/approvals/${approvalId}/reject`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ decidedByUserId: `discord:${actor}` }),
+          body: JSON.stringify({ decidedByUserId: actorUserId }),
         }, apiKey);
         throwOnRetryableStatus(r);
         return r;
@@ -1269,7 +1313,7 @@ async function handleButtonClick(
   }
 
   if (customId.startsWith("esc_")) {
-    return handleEscalationButton(ctx, customId, actor, base);
+    return handleEscalationButton(ctx, customId, actor, base, actorUserId);
   }
 
   if (customId.startsWith("handoff_")) {
@@ -1329,7 +1373,7 @@ async function handleButtonClick(
 
       await ctx.issues.update(
         issueId,
-        { assigneeUserId: `discord:${actor}` } as Record<string, unknown>,
+        { assigneeUserId: actorUserId } as Record<string, unknown>,
         issueCompanyId,
       );
     } catch (err) {
@@ -1374,6 +1418,9 @@ async function handleEscalationButton(
   customId: string,
   actor: string,
   _baseUrl: string,
+  // Resolved Paperclip user id for the clicker, or the `discord:{username}`
+  // fallback. Passed in rather than re-resolved so one click means one lookup.
+  actorUserId: string = actor,
 ): Promise<unknown> {
   // Button custom_id format: esc_{action}_{companyId}_{escalationId}
   // Legacy format (pre-fix): esc_{action}_{escalationId}
@@ -1415,7 +1462,7 @@ async function handleEscalationButton(
       {
         ...record,
         resolvedAt: new Date().toISOString(),
-        resolvedBy: `discord:${actor}`,
+        resolvedBy: actorUserId,
         resolution,
       },
     );
@@ -1848,4 +1895,116 @@ async function handleWorkflowApprovalButton(
     type: 7,
     data: { embeds, components: [] },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Discord ↔ Paperclip identity linking.
+//
+// Without a link, every Discord action is recorded as `discord:{username}` —
+// a label, not a user. Paperclip cannot tell two Discord actors apart for
+// authorization or audit, and `assigneeUserId` never resolves to a real
+// account. Linking replaces that label with the user's real Paperclip id.
+//
+// The plugin stores NO credential: the flow proves identity, reads the user
+// id, and revokes the board key it was issued. See src/identity.ts.
+// ---------------------------------------------------------------------------
+
+async function handleIdentityLink(
+  ctx: PluginContext,
+  member?: { user: { id?: string; username: string } },
+  cmdCtx?: CommandContext,
+): Promise<unknown> {
+  const discordUserId = member?.user.id;
+  if (!discordUserId) {
+    return respondToInteraction({
+      type: 4,
+      content: "Couldn't read your Discord user id, so there's nothing to link.",
+      ephemeral: true,
+    });
+  }
+
+  const existing = await getLink(ctx, discordUserId);
+  if (existing) {
+    return respondToInteraction({
+      type: 4,
+      content: `Already linked to Paperclip user \`${existing.paperclipUserId}\`. Run \`/clip unlink\` first to link a different account.`,
+      ephemeral: true,
+    });
+  }
+
+  const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
+  try {
+    const pending = await beginLink(baseUrl, member?.user.username, cmdCtx?.companyId);
+    // Persisted rather than polled in the background: an interaction handler
+    // must not leave a long-lived task running inside the host runtime. The
+    // user approves in the browser, then `/clip whoami` completes the link.
+    await savePending(ctx, discordUserId, pending);
+
+    return respondToInteraction({
+      type: 4,
+      embeds: [{
+        title: "Link your Paperclip account",
+        description: [
+          `[Open this link](${pending.approvalUrl}) and approve while signed in to Paperclip.`,
+          "",
+          "⚠️ **Only you should open it.** Whoever approves it while signed in becomes the account this Discord user acts as.",
+          "",
+          "Then run `/clip whoami` to confirm.",
+        ].join("\n"),
+        color: COLORS.BLUE,
+        footer: { text: "Paperclip" },
+        timestamp: new Date().toISOString(),
+      }],
+      ephemeral: true,
+    });
+  } catch (error) {
+    ctx.logger.error("Could not start identity link", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return respondToInteraction({
+      type: 4,
+      content: "Couldn't start the link. Check that the plugin's Paperclip base URL is reachable.",
+      ephemeral: true,
+    });
+  }
+}
+
+async function handleIdentityUnlink(
+  ctx: PluginContext,
+  member?: { user: { id?: string; username: string } },
+): Promise<unknown> {
+  const discordUserId = member?.user.id;
+  const removed = discordUserId ? await removeLink(ctx, discordUserId) : false;
+  return respondToInteraction({
+    type: 4,
+    content: removed
+      ? "Unlinked. Your Discord actions will be recorded as `discord:<username>` again."
+      : "You weren't linked to a Paperclip account.",
+    ephemeral: true,
+  });
+}
+
+async function handleIdentityWhoami(
+  ctx: PluginContext,
+  member?: { user: { id?: string; username: string } },
+  cmdCtx?: CommandContext,
+): Promise<unknown> {
+  const discordUserId = member?.user.id;
+  // Completing here is what turns an approved browser session into a link.
+  const link = discordUserId
+    ? (await getLink(ctx, discordUserId)) ??
+      (await tryCompleteLink(
+        ctx,
+        cmdCtx?.baseUrl ?? "http://localhost:3100",
+        discordUserId,
+        member?.user.username,
+      ).catch(() => null))
+    : null;
+  return respondToInteraction({
+    type: 4,
+    content: link
+      ? `Linked to Paperclip user \`${link.paperclipUserId}\` since ${link.linkedAt}. Your approvals and comments are recorded as that user.`
+      : "Not linked. Run `/clip link` — until then your actions are recorded as `discord:<username>`.",
+    ephemeral: true,
+  });
 }
