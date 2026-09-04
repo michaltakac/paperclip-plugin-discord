@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
-import { isInvocationScopeError, sdkOrRest, listAgents, listIssues } from "../src/host-or-rest.js";
+import {
+  isInvocationScopeError,
+  sdkOrRest,
+  listAgents,
+  listIssues,
+  OPEN_ISSUE_STATUSES,
+} from "../src/host-or-rest.js";
 
 // ---------------------------------------------------------------------------
 // A Discord interaction delivered over the GATEWAY is not a top-level plugin
@@ -90,5 +96,41 @@ describe("listIssues project filtering", () => {
     expect(url.searchParams.get("projectId")).toBe("proj-9");
     expect(url.searchParams.get("limit")).toBe("10");
     vi.unstubAllGlobals();
+  });
+});
+
+describe("open-issue filtering", () => {
+  it("sends one status= param per open status and never asks for done", async () => {
+    // `/clip issues` is titled "Open Issues" but asked for no status at all, so
+    // it listed mostly Done and Cancelled work.
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true, status: 200, headers: new Headers(), json: async () => [], text: async () => "",
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx: any = { issues: { list: async () => { throw new Error("the worker referenced a missing, expired, or unknown invocation scope"); } } };
+
+    await listIssues(ctx, "co-1", "https://pc.test", "k", { statuses: OPEN_ISSUE_STATUSES, limit: 10 });
+    const url = new URL(String(fetchMock.mock.calls[0]![0]));
+    expect(url.searchParams.getAll("status").sort()).toEqual(
+      ["backlog", "blocked", "in_progress", "in_review", "todo"],
+    );
+    expect(url.searchParams.getAll("status")).not.toContain("done");
+    expect(url.searchParams.getAll("status")).not.toContain("cancelled");
+    vi.unstubAllGlobals();
+  });
+
+  it("narrows client-side on the SDK path, which takes only one status", async () => {
+    const rows = [
+      { id: "1", identifier: "A-1", status: "todo", title: "open" },
+      { id: "2", identifier: "A-2", status: "done", title: "finished" },
+      { id: "3", identifier: "A-3", status: "cancelled", title: "dropped" },
+    ];
+    const ctx: any = { issues: { list: vi.fn().mockResolvedValue(rows) } };
+    const out = await listIssues(ctx, "co-1", "https://pc.test", "k", {
+      statuses: OPEN_ISSUE_STATUSES, limit: 10,
+    });
+    expect(out.map((r) => r.identifier)).toEqual(["A-1"]);
+    // and it must widen the fetch, or a page of finished work returns empty
+    expect(ctx.issues.list.mock.calls[0]![0].limit).toBeGreaterThanOrEqual(100);
   });
 });

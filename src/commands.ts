@@ -12,7 +12,14 @@ import {
   savePending,
   tryCompleteLink,
 } from "./identity.js";
-import { getIssue, listAgents, listCompanies, listIssues, listProjects } from "./host-or-rest.js";
+import {
+  getIssue,
+  listAgents,
+  listCompanies,
+  listIssues,
+  listProjects,
+  OPEN_ISSUE_STATUSES,
+} from "./host-or-rest.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
 import { resolveCompanyId } from "./company-resolver.js";
@@ -866,7 +873,11 @@ async function handleIssues(
       }
     }
 
-    const all = await listIssues(ctx, companyId, api, apiKey, { limit: 10, projectId });
+    const all = await listIssues(ctx, companyId, api, apiKey, {
+      limit: 10,
+      projectId,
+      statuses: OPEN_ISSUE_STATUSES,
+    });
 
     // Client-side name filter, kept for the host-SDK shape, which carries a
     // nested `project` the REST payload does not. Skipped once the server has

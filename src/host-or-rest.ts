@@ -105,20 +105,52 @@ export function listAgents(
 export type IssueStatus =
   | "todo" | "in_progress" | "in_review" | "done" | "blocked" | "backlog" | "cancelled";
 
+/**
+ * What "open" means: everything except finished work.
+ *
+ * `/clip issues` is titled "Open Issues" but asked for no status at all, so it
+ * listed the ten most recent issues whatever their state — mostly Done and
+ * Cancelled. Paperclip accepts repeated `status=` parameters, so the filter can
+ * be stated exactly instead of approximated.
+ */
+export const OPEN_ISSUE_STATUSES: IssueStatus[] = [
+  "todo", "in_progress", "in_review", "blocked", "backlog",
+];
+
 export function listIssues(
   ctx: PluginContext,
   companyId: string,
   baseUrl: string,
   apiKey?: string,
-  opts: { status?: IssueStatus; limit?: number; projectId?: string } = {},
+  opts: {
+    status?: IssueStatus;
+    /** Repeated `status=` params; the API unions them. */
+    statuses?: IssueStatus[];
+    limit?: number;
+    projectId?: string;
+  } = {},
 ): Promise<IssueRow[]> {
   const query = new URLSearchParams();
   if (opts.status) query.set("status", opts.status);
+  for (const st of opts.statuses ?? []) query.append("status", st);
   if (opts.projectId) query.set("projectId", opts.projectId);
   if (opts.limit) query.set("limit", String(opts.limit));
   const suffix = query.toString() ? `?${query}` : "";
+  const wanted = new Set<string>(opts.statuses ?? []);
   return sdkOrRest(
-    () => ctx.issues.list({ companyId, ...opts }) as Promise<IssueRow[]>,
+    async () => {
+      // The host SDK takes a single status, so a multi-status request is made
+      // unfiltered and narrowed here. Fetch wider than the limit first, or the
+      // page could be all finished work and come back empty.
+      const { statuses: _statuses, ...sdkOpts } = opts;
+      const rows = (await ctx.issues.list({
+        companyId,
+        ...sdkOpts,
+        ...(wanted.size ? { limit: Math.max(opts.limit ?? 10, 100) } : {}),
+      })) as IssueRow[];
+      const narrowed = wanted.size ? rows.filter((r) => wanted.has(r.status)) : rows;
+      return opts.limit ? narrowed.slice(0, opts.limit) : narrowed;
+    },
     async () =>
       asList<Record<string, unknown>>(
         await restJson(baseUrl, `/api/companies/${companyId}/issues${suffix}`, apiKey),
