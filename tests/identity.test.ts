@@ -145,3 +145,31 @@ describe("linking", () => {
     expect(await removeLink(ctx, "111")).toBe(false);
   });
 });
+
+describe("approval link", () => {
+  it("uses the PUBLIC url, not the internal one", async () => {
+    // Paperclip derives approvalUrl from the origin the request arrived on, so
+    // a plugin calling http://127.0.0.1:3102 gets a link no browser can open.
+    // Observed live: /clip link handed out http://127.0.0.1:3102/cli-auth/...
+    fetchMock.mockResolvedValueOnce(ok({
+      id: "ch1", token: "sec", boardApiToken: "t",
+      approvalUrl: "http://127.0.0.1:3102/cli-auth/ch1?token=sec",
+      approvalPath: "/cli-auth/ch1?token=sec",
+      expiresAt: "e",
+    }));
+    const p = await beginLink(BASE, "alice", "co-1", "https://paperclip.example.com/");
+    expect(p.approvalUrl).toBe("https://paperclip.example.com/cli-auth/ch1?token=sec");
+    expect(p.approvalUrl).not.toMatch(/127\.0\.0\.1/);
+  });
+
+  it("keeps whatever Paperclip returned when no public url is set", async () => {
+    fetchMock.mockResolvedValueOnce(ok({
+      id: "ch1", token: "sec", boardApiToken: "t",
+      approvalUrl: "https://pc.test/cli-auth/ch1?token=sec",
+      approvalPath: "/cli-auth/ch1?token=sec",
+      expiresAt: "e",
+    }));
+    const p = await beginLink(BASE, "alice", "co-1");
+    expect(p.approvalUrl).toBe("https://pc.test/cli-auth/ch1?token=sec");
+  });
+});

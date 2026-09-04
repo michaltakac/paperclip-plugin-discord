@@ -76,6 +76,8 @@ type DiscordConfig = {
    * Who may run privileged commands. Both empty = every server member, which
    * is the historical behaviour and only safe on a private guild.
    */
+  /** URL humans open Paperclip on; falls back to paperclipBaseUrl. */
+  paperclipPublicUrl?: string;
   adminUserIds?: string[] | string;
   adminRoleIds?: string[] | string;
   defaultGuildId: string;
@@ -241,6 +243,8 @@ function normalizeIdList(value: unknown): string[] {
 
 type DiscordRuntime = {
   companyId: string;
+  /** URL humans click; equals baseUrl unless paperclipPublicUrl is set. */
+  publicUrl: string;
   config: DiscordConfig;
   token: string;
   tokenSecretId: string;
@@ -645,7 +649,9 @@ async function notify(
   );
   if (!channelId) return;
 
-  const message = formatter(event, rt.baseUrl);
+  // Links in Discord are clicked by people, so they must use the PUBLIC URL —
+  // rt.baseUrl may be an internal address the plugin can reach and a browser cannot.
+  const message = formatter(event, rt.publicUrl);
   const messageId = await postEmbedWithId(ctx, rt.token, channelId, message);
 
   if (messageId) {
@@ -1302,8 +1308,11 @@ async function bootstrapRuntime(
   rt.baseUrl = baseUrl;
   const adminUserIds = normalizeIdList(config.adminUserIds);
   const adminRoleIds = normalizeIdList(config.adminRoleIds);
+  const publicUrl = (config.paperclipPublicUrl || "").trim() || baseUrl;
+  rt.publicUrl = publicUrl;
   rt.cmdCtx = {
     baseUrl,
+    publicUrl,
     companyId,
     token,
     paperclipBoardApiKey,

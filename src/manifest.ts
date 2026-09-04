@@ -71,6 +71,12 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "Optional. A Paperclip board API key, stored as a secret. Required when Paperclip is deployed in `authenticated` mode so that plugin-originated calls (approve/reject buttons, workflow steps, inbound reply routing) can satisfy server-side board-auth checks. Create a board API key in Settings → API Keys, store it as a secret, then pick it here. Leave empty for `local_trusted` deployments.",
       },
+      paperclipPublicUrl: {
+        type: "string",
+        title: "Paperclip public URL (links humans click)",
+        description:
+          "The URL your people open Paperclip on, e.g. https://paperclip.example.com. Used for every link posted to Discord — View Issue buttons, approval links, and the /clip link approval page. Leave empty to reuse the Paperclip Base URL. Set this whenever the plugin reaches Paperclip on an internal address (http://127.0.0.1:3102, a container name), because that address is unreachable from a browser.",
+      },
       adminUserIds: {
         type: "array",
         items: { type: "string" },

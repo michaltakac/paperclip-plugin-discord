@@ -49,6 +49,12 @@ interface Interaction {
 
 export interface CommandContext {
   baseUrl: string;
+  /**
+   * The URL people open Paperclip on. Differs from baseUrl whenever the plugin
+   * reaches Paperclip internally (container name, 127.0.0.1) — an address that
+   * is useless in a Discord message.
+   */
+  publicUrl?: string;
   companyId: string;
   /** Discord bot token — used for Discord API calls. */
   token: string;
@@ -2033,7 +2039,12 @@ async function handleIdentityLink(
 
   const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
   try {
-    const pending = await beginLink(baseUrl, member?.user.username, cmdCtx?.companyId);
+    const pending = await beginLink(
+      baseUrl,
+      member?.user.username,
+      cmdCtx?.companyId,
+      cmdCtx?.publicUrl,
+    );
     // Persisted rather than polled in the background: an interaction handler
     // must not leave a long-lived task running inside the host runtime. The
     // user approves in the browser, then `/clip whoami` completes the link.

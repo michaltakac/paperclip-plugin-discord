@@ -182,6 +182,13 @@ export async function beginLink(
   baseUrl: string,
   discordUsername: string | undefined,
   companyId?: string,
+  /**
+   * Where the human opens Paperclip. Paperclip builds `approvalUrl` from the
+   * origin the REQUEST arrived on, so a plugin calling an internal address gets
+   * back something like http://127.0.0.1:3102/cli-auth/... — which no browser
+   * can open. When set, the link is rebuilt from `approvalPath` instead.
+   */
+  publicBaseUrl?: string,
 ): Promise<PendingChallenge> {
   const res = await paperclipFetch(`${baseUrl}/api/cli-auth/challenges`, {
     method: "POST",
@@ -196,11 +203,16 @@ export async function beginLink(
     }),
   });
   const body = (await res.json()) as Record<string, any>;
+  const publicBase = (publicBaseUrl ?? "").replace(/\/+$/, "");
+  const approvalUrl =
+    publicBase && body.approvalPath
+      ? `${publicBase}${body.approvalPath}`
+      : String(body.approvalUrl ?? body.approvalPath ?? "");
   return {
     id: String(body.id),
     token: String(body.token),
     boardToken: String(body.boardApiToken),
-    approvalUrl: String(body.approvalUrl ?? body.approvalPath ?? ""),
+    approvalUrl,
     expiresAt: String(body.expiresAt ?? ""),
   };
 }
