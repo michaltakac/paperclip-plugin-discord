@@ -836,28 +836,61 @@ async function handleIssues(
 ): Promise<unknown> {
   const api = baseUrl ?? "http://localhost:3100";
   try {
-    const issues = await listIssues(ctx, companyId, api, apiKey, { limit: 10 });
-    const filtered = projectFilter
-      ? issues.filter((i: { project?: { name?: string } | null }) => {
-          const projName = i.project?.name ?? "";
-          return projName.toLowerCase().includes(projectFilter.toLowerCase());
-        })
-      : issues;
+    // Resolve the project NAME to an id and let Paperclip filter server-side.
+    //
+    // The previous approach fetched a page of issues and filtered on
+    // `issue.project?.name`. Two problems: the REST payload carries only
+    // `projectId` (no nested project), so the filter never matched at all on
+    // the gateway path; and filtering after `limit: 10` reports "none" for any
+    // project whose issues are not in the newest ten.
+    let projectId: string | undefined;
+    let projectLabel: string | undefined;
+    if (projectFilter) {
+      // Best-effort: if we can name the project, Paperclip filters server-side
+      // and the `limit` then applies to that project rather than to everything.
+      try {
+        const projects = await listProjects(ctx, companyId, api, apiKey);
+        const needle = projectFilter.toLowerCase();
+        const match =
+          projects.find((p) => (p.name ?? "").toLowerCase() === needle) ??
+          projects.find((p) => (p.name ?? "").toLowerCase().includes(needle)) ??
+          projects.find((p) => p.id === projectFilter);
+        if (match) {
+          projectId = match.id;
+          projectLabel = match.name ?? match.id;
+        }
+      } catch {
+        // Fall through to the name filter below.
+      }
+    }
 
-    if (filtered.length === 0) {
-      const filter = projectFilter ? ` for project "${projectFilter}"` : "";
+    const all = await listIssues(ctx, companyId, api, apiKey, { limit: 10, projectId });
+
+    // Client-side name filter, kept for the host-SDK shape, which carries a
+    // nested `project` the REST payload does not. Skipped once the server has
+    // already filtered by id, and skipped when no issue carries a project
+    // object — otherwise it would drop everything the server just returned.
+    const canFilterByName =
+      !projectId && Boolean(projectFilter) && all.some((i) => i.project?.name);
+    const issues = canFilterByName
+      ? all.filter((i) => (i.project?.name ?? "").toLowerCase().includes(projectFilter!.toLowerCase()))
+      : all;
+
+    if (issues.length === 0) {
+      const suffix = projectFilter ? ` for project "${projectLabel ?? projectFilter}"` : "";
       return respondToInteraction({
         type: 4,
-        content: `No issues found${filter}.`,
+        content: `No issues found${suffix}.`,
         ephemeral: true,
       });
     }
 
+    // Presentation is upstream's, unchanged — only the filtering moved.
     const statusEmoji: Record<string, string> = {
       done: "✅", todo: "📋", in_progress: "🔄", backlog: "📥", blocked: "🚫", in_review: "🔍",
     };
 
-    const fields = filtered.map((i: { identifier?: string | null; id: string; title?: string; status: string }) => {
+    const fields = issues.map((i) => {
       const emoji = statusEmoji[i.status] ?? "📋";
       const id = i.identifier ?? i.id;
       return {
@@ -866,17 +899,17 @@ async function handleIssues(
       };
     });
 
-    const embeds: DiscordEmbed[] = [
-      {
-        title: `Open Issues${projectFilter ? ` (${projectFilter})` : ""}`,
+    return respondToInteraction({
+      type: 4,
+      embeds: [{
+        title: `Open Issues${projectFilter ? ` (${projectLabel ?? projectFilter})` : ""}`,
         color: COLORS.BLUE,
         fields,
         footer: { text: "Paperclip" },
         timestamp: new Date().toISOString(),
-      },
-    ];
-
-    return respondToInteraction({ type: 4, embeds, ephemeral: true });
+      }],
+      ephemeral: true,
+    });
   } catch (error) {
     return respondToInteraction({
       type: 4,

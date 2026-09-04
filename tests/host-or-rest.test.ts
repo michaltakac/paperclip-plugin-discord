@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { isInvocationScopeError, sdkOrRest, listAgents } from "../src/host-or-rest.js";
+import { isInvocationScopeError, sdkOrRest, listAgents, listIssues } from "../src/host-or-rest.js";
 
 // ---------------------------------------------------------------------------
 // A Discord interaction delivered over the GATEWAY is not a top-level plugin
@@ -67,6 +67,28 @@ describe("listAgents", () => {
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(String(url)).toBe("https://pc.test/api/companies/co-1/agents");
     expect((init as any).headers.get("Authorization")).toBe("Bearer pcp_board_x");
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("listIssues project filtering", () => {
+  it("passes projectId to the API so filtering happens server-side", async () => {
+    // The REST payload has no nested `project`, so a client-side name filter
+    // matches nothing — every project reported "No issues found". And filtering
+    // after `limit` reports empty for any project outside the newest page.
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true, status: 200, headers: new Headers(),
+      json: async () => [{ id: "i1", identifier: "AGE-505", status: "todo", title: "x" }],
+      text: async () => "",
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx: any = { issues: { list: async () => { throw new Error("the worker referenced a missing, expired, or unknown invocation scope"); } } };
+
+    const rows = await listIssues(ctx, "co-1", "https://pc.test", "k", { projectId: "proj-9", limit: 10 });
+    expect(rows[0]!.identifier).toBe("AGE-505");
+    const url = new URL(String(fetchMock.mock.calls[0]![0]));
+    expect(url.searchParams.get("projectId")).toBe("proj-9");
+    expect(url.searchParams.get("limit")).toBe("10");
     vi.unstubAllGlobals();
   });
 });

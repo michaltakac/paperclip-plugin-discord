@@ -103,10 +103,11 @@ export function listIssues(
   companyId: string,
   baseUrl: string,
   apiKey?: string,
-  opts: { status?: IssueStatus; limit?: number } = {},
+  opts: { status?: IssueStatus; limit?: number; projectId?: string } = {},
 ): Promise<IssueRow[]> {
   const query = new URLSearchParams();
   if (opts.status) query.set("status", opts.status);
+  if (opts.projectId) query.set("projectId", opts.projectId);
   if (opts.limit) query.set("limit", String(opts.limit));
   const suffix = query.toString() ? `?${query}` : "";
   return sdkOrRest(
