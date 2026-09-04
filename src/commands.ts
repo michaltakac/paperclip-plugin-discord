@@ -439,9 +439,18 @@ async function handleSlashCommand(
   interactionChannelId?: string,
 ): Promise<unknown> {
   // Lazy company-ID resolution: resolve on first command, not at startup.
-  const companyId = cmdCtx?.pluginCtx
-    ? await resolveCompanyId(cmdCtx.pluginCtx)
-    : (cmdCtx?.companyId ?? "default");
+  //
+  // `cmdCtx.companyId` comes from the host's configuration delivery and is
+  // authoritative. resolveCompanyId() is still tried first so a `/clip connect`
+  // override wins, but on the gateway path its state read and companies.list
+  // are both refused for lack of invocation scope — and its "default" sentinel
+  // then 403s downstream ("User does not have access to this company").
+  // Falling back to the configured id is what keeps commands working there.
+  const resolved = cmdCtx?.pluginCtx
+    ? await resolveCompanyId(cmdCtx.pluginCtx, cmdCtx.baseUrl, cmdCtx.paperclipBoardApiKey)
+    : "default";
+  const companyId =
+    resolved !== "default" ? resolved : (cmdCtx?.companyId ?? "default");
 
   if (data.name === "acp") {
     return handleAcpCommand(

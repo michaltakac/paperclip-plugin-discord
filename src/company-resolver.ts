@@ -1,4 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { listCompanies } from "./host-or-rest.js";
 
 /**
  * Lazy company-ID resolver — avoids startup-time API calls that can crash
@@ -11,7 +12,11 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  */
 let _cachedCompanyId: string | null = null;
 
-export async function resolveCompanyId(ctx: PluginContext): Promise<string> {
+export async function resolveCompanyId(
+  ctx: PluginContext,
+  baseUrl?: string,
+  apiKey?: string,
+): Promise<string> {
   // Check if a guild-level default was set via /clip connect — always re-read
   // so that switching companies works without a plugin restart.
   try {
@@ -25,9 +30,16 @@ export async function resolveCompanyId(ctx: PluginContext): Promise<string> {
 
   if (_cachedCompanyId) return _cachedCompanyId;
   try {
-    const companies = await ctx.companies.list({ limit: 1 });
+    // REST fallback matters here: on the gateway path BOTH the state read
+    // above and a host companies.list are refused for lack of invocation
+    // scope, so without it this always degrades to the literal "default" and
+    // every downstream call 403s with "User does not have access to this
+    // company".
+    const companies = baseUrl
+      ? await listCompanies(ctx, baseUrl, apiKey)
+      : await ctx.companies.list({ limit: 1 });
     if (companies.length > 0) {
-      _cachedCompanyId = companies[0].id;
+      _cachedCompanyId = companies[0]!.id;
       return _cachedCompanyId;
     }
   } catch (err) {
