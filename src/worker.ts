@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readState, writeState } from "./safe-state.js";
 import {
   definePlugin,
@@ -1369,9 +1370,34 @@ async function bootstrapRuntime(
     try {
       const appId = await getApplicationId(ctx, token);
       if (appId) {
-        const registered = await registerSlashCommands(ctx, token, appId, defaultGuildId, SLASH_COMMANDS);
-        if (registered) {
-          ctx.logger.info("Slash commands registered with Discord");
+        // Re-register ONLY when the definitions actually changed.
+        //
+        // Every PUT bumps the command version, and clients holding the previous
+        // definition then answer an invocation with "This command is outdated,
+        // please try again in a few minutes". A worker restart is not a reason
+        // to invalidate everyone's command cache — and during active
+        // development the worker restarts constantly.
+        const fingerprint = createHash("sha256")
+          .update(JSON.stringify(SLASH_COMMANDS))
+          .digest("hex")
+          .slice(0, 16);
+        const scope = {
+          scopeKind: "instance" as const,
+          stateKey: `slash_commands_registered:${defaultGuildId}`,
+        };
+        const previous = (await readState<{ fingerprint?: string }>(ctx, scope))?.fingerprint;
+
+        if (previous === fingerprint) {
+          ctx.logger.info("Slash commands unchanged; skipping re-registration", { fingerprint });
+        } else {
+          const registered = await registerSlashCommands(ctx, token, appId, defaultGuildId, SLASH_COMMANDS);
+          if (registered) {
+            await writeState(ctx, scope, { fingerprint, at: new Date().toISOString() });
+            ctx.logger.info("Slash commands registered with Discord", {
+              fingerprint,
+              previous: previous ?? "(none)",
+            });
+          }
         }
       }
     } catch (err) {
