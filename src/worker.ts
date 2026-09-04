@@ -72,6 +72,12 @@ type DiscordConfig = {
    */
   discordBotTokenRef: DiscordSecretRef;
   paperclipBoardApiKeyRef?: DiscordSecretRef;
+  /**
+   * Who may run privileged commands. Both empty = every server member, which
+   * is the historical behaviour and only safe on a private guild.
+   */
+  adminUserIds?: string[] | string;
+  adminRoleIds?: string[] | string;
   defaultGuildId: string;
   defaultChannelId: string;
   approvalsChannelId: string;
@@ -225,6 +231,13 @@ type VoiceSession = {
     logged: boolean;
   };
 };
+
+/** Config lists arrive as arrays, a comma/space string, or nothing at all. */
+function normalizeIdList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((v) => String(v).trim()).filter(Boolean);
+  if (typeof value === "string") return value.split(/[\s,]+/).map((v) => v.trim()).filter(Boolean);
+  return [];
+}
 
 type DiscordRuntime = {
   companyId: string;
@@ -1287,6 +1300,8 @@ async function bootstrapRuntime(
   rt.tokenSecretId = normalizeSecretRefId(config.discordBotTokenRef) ?? "";
   rt.paperclipBoardApiKey = paperclipBoardApiKey;
   rt.baseUrl = baseUrl;
+  const adminUserIds = normalizeIdList(config.adminUserIds);
+  const adminRoleIds = normalizeIdList(config.adminRoleIds);
   rt.cmdCtx = {
     baseUrl,
     companyId,
@@ -1294,7 +1309,18 @@ async function bootstrapRuntime(
     paperclipBoardApiKey,
     defaultChannelId,
     pluginCtx: ctx,
+    adminUserIds,
+    adminRoleIds,
   };
+  if (adminUserIds.length === 0 && adminRoleIds.length === 0) {
+    // Said once, at bootstrap: every member of the guild can approve Paperclip
+    // approvals, import and run workflows, and spawn agent sessions. That is
+    // fine for a private server and not fine for a community one.
+    ctx.logger.warn(
+      "Discord plugin privileged commands are open to every server member; set adminUserIds/adminRoleIds to restrict them",
+      { companyId },
+    );
+  }
   rt.adapter = new DiscordAdapter(ctx, token);
   rt.defaultGuildId = defaultGuildId;
   rt.defaultChannelId = defaultChannelId;

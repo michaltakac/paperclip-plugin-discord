@@ -71,6 +71,20 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "Optional. A Paperclip board API key, stored as a secret. Required when Paperclip is deployed in `authenticated` mode so that plugin-originated calls (approve/reject buttons, workflow steps, inbound reply routing) can satisfy server-side board-auth checks. Create a board API key in Settings → API Keys, store it as a secret, then pick it here. Leave empty for `local_trusted` deployments.",
       },
+      adminUserIds: {
+        type: "array",
+        items: { type: "string" },
+        title: "Privileged Discord user IDs",
+        description:
+          "Discord user IDs allowed to run privileged commands (approve/reject, workflow import/run/delete, /acp spawn, connect, digest). Leave empty to allow every member of the server — which is the historical behaviour, and appropriate only for a private, invite-only guild.",
+      },
+      adminRoleIds: {
+        type: "array",
+        items: { type: "string" },
+        title: "Privileged Discord role IDs",
+        description:
+          "Discord role IDs whose members may run privileged commands. Combined with Privileged Discord user IDs; a user matching either is allowed.",
+      },
       defaultGuildId: {
         type: "string",
         title: "Default Guild (Server) ID",

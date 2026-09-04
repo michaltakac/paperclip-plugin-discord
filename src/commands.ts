@@ -42,7 +42,7 @@ interface InteractionData {
 interface Interaction {
   type: number;
   data?: InteractionData;
-  member?: { user: { id?: string; username: string } };
+  member?: { user: { id?: string; username: string }; roles?: string[] };
   channel_id?: string;
 }
 
@@ -59,6 +59,45 @@ export interface CommandContext {
   defaultChannelId: string;
   /** PluginContext for lazy company-ID resolution at command time. */
   pluginCtx?: PluginContext;
+  /**
+   * Discord user / role IDs permitted to run privileged commands.
+   *
+   * Both empty preserves the historical behaviour — every member of the guild
+   * can approve Paperclip approvals, import and run workflows (which invoke
+   * agents, create issues and make outbound HTTP calls), and spawn agent
+   * sessions that spend budget. That is only appropriate for a private,
+   * invite-only server.
+   */
+  adminUserIds?: string[];
+  adminRoleIds?: string[];
+}
+
+/** Commands that act on Paperclip or spend budget, as opposed to reading. */
+const PRIVILEGED_SUBCOMMANDS = new Set([
+  "approve",
+  "commands",
+  "connect",
+  "connect-channel",
+  "digest",
+]);
+
+/**
+ * Is this Discord member allowed to run privileged commands?
+ *
+ * Open by default (both lists empty) so existing installs are unaffected; the
+ * worker logs once at startup when it is running open.
+ */
+export function isPrivilegedActor(
+  member: { user: { id?: string }; roles?: string[] } | undefined,
+  cmdCtx?: CommandContext,
+): boolean {
+  const users = cmdCtx?.adminUserIds ?? [];
+  const roles = cmdCtx?.adminRoleIds ?? [];
+  if (users.length === 0 && roles.length === 0) return true;
+  const userId = member?.user.id;
+  if (userId && users.includes(userId)) return true;
+  const memberRoles = member?.roles ?? [];
+  return memberRoles.some((r) => roles.includes(r));
 }
 
 function getOption(
@@ -394,7 +433,7 @@ export async function handleInteraction(
 async function handleSlashCommand(
   ctx: PluginContext,
   data: InteractionData,
-  member?: { user: { id?: string; username: string } },
+  member?: { user: { id?: string; username: string }; roles?: string[] },
   cmdCtx?: CommandContext,
   interactionChannelId?: string,
 ): Promise<unknown> {
@@ -436,6 +475,14 @@ async function handleSlashCommand(
 
   const subName = subcommand.name;
   const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
+
+  if (PRIVILEGED_SUBCOMMANDS.has(subName) && !isPrivilegedActor(member, cmdCtx)) {
+    return respondToInteraction({
+      type: 4,
+      content: `\`/clip ${subName}\` is restricted to this server's Paperclip operators.`,
+      ephemeral: true,
+    });
+  }
 
   switch (subName) {
     case "status":

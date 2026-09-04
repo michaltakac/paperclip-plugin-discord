@@ -65,6 +65,22 @@ function normalizeDiscordPathId(id: string | number): string {
   return String(id);
 }
 
+/**
+ * Every outbound message suppresses mention parsing.
+ *
+ * Message text is assembled from Paperclip-sourced values — issue titles,
+ * agent display names, agent output, escalation context, digest lines. Any of
+ * those can contain `@everyone`, and `content` (unlike embed bodies) pings.
+ * `agentDisplayName` is the sharpest example: it is interpolated OUTSIDE the
+ * code fence in thread output, so an agent named `@everyone` would mass-ping
+ * the server on every message it emits.
+ *
+ * An empty `parse` list means no @everyone, no @here, no role or user pings,
+ * regardless of content. Notification text has no legitimate need to ping, so
+ * this is applied unconditionally rather than per call site.
+ */
+export const NO_MENTIONS = { parse: [] as string[] };
+
 export async function postEmbed(
   ctx: PluginContext,
   token: string,
@@ -84,6 +100,7 @@ export async function postEmbed(
             content: message.content,
             embeds: message.embeds,
             components: message.components,
+            allowed_mentions: NO_MENTIONS,
           },
         },
       );
@@ -133,6 +150,7 @@ export async function postEmbedWithId(
             content: message.content,
             embeds: message.embeds,
             components: message.components,
+            allowed_mentions: NO_MENTIONS,
           },
         },
       );
