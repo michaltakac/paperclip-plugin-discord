@@ -1,3 +1,4 @@
+import { readState, writeState } from "./safe-state.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { postEmbedWithId } from "./discord-api.js";
 import { COLORS } from "./constants.js";
@@ -314,7 +315,7 @@ async function execWaitApproval(
   if (!msgId) return { ok: false, error: "Failed to send approval message" };
 
   // Store suspended workflow state so it can be resumed on button click
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId: companyId, stateKey: `wf_pending_${approvalId}` },
     {
       approvalId,
@@ -454,7 +455,7 @@ export async function getWorkflowStore(
   ctx: PluginContext,
   companyId: string,
 ): Promise<WorkflowCommandStore> {
-  const raw = await ctx.state.get({
+  const raw = await readState(ctx, {
     scopeKind: "company",
     scopeId: companyId,
     stateKey: `${STORE_KEY_PREFIX}${companyId}`,
@@ -468,7 +469,7 @@ export async function saveWorkflowStore(
   companyId: string,
   store: WorkflowCommandStore,
 ): Promise<void> {
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId: companyId, stateKey: `${STORE_KEY_PREFIX}${companyId}` },
     store,
   );
@@ -488,7 +489,7 @@ export async function resumeWorkflowAfterApproval(
   approved: boolean,
   paperclipBoardApiKey: string,
 ): Promise<{ ok: boolean; error?: string }> {
-  const pending = (await ctx.state.get({
+  const pending = (await readState(ctx, {
     scopeKind: "company",
     scopeId: companyId,
     stateKey: `wf_pending_${approvalId}`,
@@ -501,7 +502,7 @@ export async function resumeWorkflowAfterApproval(
   if (!pending) return { ok: false, error: "Pending workflow not found" };
 
   // Clean up the pending state
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId: companyId, stateKey: `wf_pending_${approvalId}` },
     null,
   );

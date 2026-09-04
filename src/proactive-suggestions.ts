@@ -1,3 +1,4 @@
+import { readState, writeState } from "./safe-state.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { postEmbed, getChannelMessages } from "./discord-api.js";
 import { COLORS, METRIC_NAMES } from "./constants.js";
@@ -32,7 +33,7 @@ interface WatchRegistry {
 // ---------------------------------------------------------------------------
 
 async function getWatches(ctx: PluginContext, companyId: string): Promise<WatchEntry[]> {
-  const raw = await ctx.state.get({
+  const raw = await readState(ctx, {
     scopeKind: "company",
     scopeId: companyId,
     stateKey: "proactive_watches",
@@ -42,7 +43,7 @@ async function getWatches(ctx: PluginContext, companyId: string): Promise<WatchE
 }
 
 async function saveWatches(ctx: PluginContext, companyId: string, watches: WatchEntry[]): Promise<void> {
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId: companyId, stateKey: "proactive_watches" },
     { watches } as WatchRegistry,
   );

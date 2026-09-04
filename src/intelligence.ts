@@ -1,3 +1,4 @@
+import { readState, writeState } from "./safe-state.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import {
   type DiscordChannelMessage,
@@ -181,7 +182,7 @@ export async function runIntelligenceScan(
     return b.timestamp.localeCompare(a.timestamp);
   });
 
-  await ctx.state.set(
+  await writeState(ctx, 
     {
       scopeKind: "company",
       scopeId: companyId,
@@ -262,7 +263,7 @@ export async function runBackfill(
   }
 
   // Load existing signals and merge (dedup by messageId)
-  const existing = await ctx.state.get({
+  const existing = await readState(ctx, {
     scopeKind: "company",
     scopeId: companyId,
     stateKey: "discord_intelligence",
@@ -271,7 +272,7 @@ export async function runBackfill(
   const existingSignals = existing?.signals ?? [];
   const merged = mergeSignals(existingSignals, allSignals);
 
-  await ctx.state.set(
+  await writeState(ctx, 
     {
       scopeKind: "company",
       scopeId: companyId,
