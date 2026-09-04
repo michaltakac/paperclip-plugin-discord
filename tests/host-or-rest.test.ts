@@ -150,6 +150,11 @@ describe("resolveStatusFilter", () => {
     expect(resolveStatusFilter("DONE")!.statuses).toEqual(["done"]);
   });
 
+  it("title-cases the label, since it is rendered in the embed heading", () => {
+    expect(resolveStatusFilter("in_progress")!.label).toBe("In Progress");
+    expect(resolveStatusFilter("done")!.label).toBe("Done");
+  });
+
   it("returns null for nonsense rather than silently listing everything", () => {
     // The failure mode this avoids: an unrecognised filter falling through to
     // no filter, which looks like a real answer.

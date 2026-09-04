@@ -140,7 +140,13 @@ export function resolveStatusFilter(
   if (value === "all" || value === "any") return { statuses: ALL_ISSUE_STATUSES, label: "All" };
   if (value === "closed") return { statuses: CLOSED_ISSUE_STATUSES, label: "Closed" };
   const one = ALL_ISSUE_STATUSES.find((s) => s === value || s.replace(/_/g, " ") === value);
-  return one ? { statuses: [one], label: one.replace(/_/g, " ") } : null;
+  if (!one) return null;
+  // Title-case, so the embed reads "In Progress Issues", not "in_progress Issues".
+  const label = one
+    .split("_")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+  return { statuses: [one], label };
 }
 
 export function listIssues(
