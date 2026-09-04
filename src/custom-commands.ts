@@ -1,3 +1,4 @@
+import { readState, writeState } from "./safe-state.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { postEmbed } from "./discord-api.js";
 import { COLORS, METRIC_NAMES } from "./constants.js";
@@ -34,7 +35,7 @@ interface CommandRegistry {
 // ---------------------------------------------------------------------------
 
 async function getRegistry(ctx: PluginContext, companyId: string): Promise<CustomCommand[]> {
-  const raw = await ctx.state.get({
+  const raw = await readState(ctx, {
     scopeKind: "company",
     scopeId: companyId,
     stateKey: "custom_commands",
@@ -44,7 +45,7 @@ async function getRegistry(ctx: PluginContext, companyId: string): Promise<Custo
 }
 
 async function saveRegistry(ctx: PluginContext, companyId: string, commands: CustomCommand[]): Promise<void> {
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId: companyId, stateKey: "custom_commands" },
     { commands } as CommandRegistry,
   );

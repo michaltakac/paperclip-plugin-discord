@@ -1,3 +1,4 @@
+import { readState, writeState } from "./safe-state.js";
 import type { PluginContext, AgentSessionEvent } from "@paperclipai/plugin-sdk";
 import type { DiscordEmbed, DiscordComponent } from "./discord-api.js";
 import { postEmbed, respondToInteraction } from "./discord-api.js";
@@ -142,11 +143,11 @@ export async function getThreadSessions(
 ): Promise<AgentSessionEntry[]> {
   const key = sessionsKey(threadId);
   if (companyId) {
-    const raw = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: key });
+    const raw = await readState(ctx, { scopeKind: "company", scopeId: companyId, stateKey: key });
     if (raw) return (raw as ThreadSessions).sessions ?? [];
   }
   // Backward-compat fallback: read from "default" scope
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readState(ctx, { scopeKind: "company", scopeId: "default", stateKey: key });
   if (!fallback) return [];
   return (fallback as ThreadSessions).sessions ?? [];
 }
@@ -157,7 +158,7 @@ async function saveThreadSessions(
   sessions: AgentSessionEntry[],
   companyId: string = "default",
 ): Promise<void> {
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId: companyId, stateKey: sessionsKey(threadId) },
     { sessions } as ThreadSessions,
   );
@@ -166,16 +167,16 @@ async function saveThreadSessions(
 async function getHandoff(ctx: PluginContext, handoffId: string, companyId?: string): Promise<HandoffRecord | null> {
   const key = `handoff_${handoffId}`;
   if (companyId) {
-    const raw = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: key });
+    const raw = await readState(ctx, { scopeKind: "company", scopeId: companyId, stateKey: key });
     if (raw) return raw as HandoffRecord;
   }
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readState(ctx, { scopeKind: "company", scopeId: "default", stateKey: key });
   return (fallback as HandoffRecord) ?? null;
 }
 
 async function saveHandoff(ctx: PluginContext, record: HandoffRecord): Promise<void> {
   const scopeId = record.companyId || "default";
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId, stateKey: `handoff_${record.handoffId}` },
     record,
   );
@@ -184,16 +185,16 @@ async function saveHandoff(ctx: PluginContext, record: HandoffRecord): Promise<v
 async function getDiscussion(ctx: PluginContext, id: string, companyId?: string): Promise<DiscussionLoop | null> {
   const key = `discussion_${id}`;
   if (companyId) {
-    const raw = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: key });
+    const raw = await readState(ctx, { scopeKind: "company", scopeId: companyId, stateKey: key });
     if (raw) return raw as DiscussionLoop;
   }
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readState(ctx, { scopeKind: "company", scopeId: "default", stateKey: key });
   return (fallback as DiscussionLoop) ?? null;
 }
 
 async function saveDiscussion(ctx: PluginContext, record: DiscussionLoop): Promise<void> {
   const scopeId = record.companyId || "default";
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId, stateKey: `discussion_${record.discussionId}` },
     record,
   );
@@ -202,15 +203,15 @@ async function saveDiscussion(ctx: PluginContext, record: DiscussionLoop): Promi
 async function findActiveDiscussion(ctx: PluginContext, threadId: string, companyId?: string): Promise<string | null> {
   const key = `active_discussion_${threadId}`;
   if (companyId) {
-    const raw = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: key });
+    const raw = await readState(ctx, { scopeKind: "company", scopeId: companyId, stateKey: key });
     if (raw) return raw as string;
   }
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readState(ctx, { scopeKind: "company", scopeId: "default", stateKey: key });
   return (fallback as string) ?? null;
 }
 
 async function clearActiveDiscussion(ctx: PluginContext, threadId: string, companyId: string = "default"): Promise<void> {
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId: companyId, stateKey: `active_discussion_${threadId}` },
     null,
   );
@@ -863,7 +864,7 @@ export async function startDiscussion(
   };
   await saveDiscussion(ctx, record);
 
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId: companyId, stateKey: `active_discussion_${threadId}` },
     discussionId,
   );

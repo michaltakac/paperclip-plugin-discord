@@ -26,6 +26,7 @@
  * is what makes this safe to enable by default.
  */
 
+import { readState, writeState } from "./safe-state.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { paperclipFetch } from "./paperclip-fetch.js";
 
@@ -64,14 +65,14 @@ export async function savePending(
   discordUserId: string,
   pending: PendingChallenge | null,
 ): Promise<void> {
-  await ctx.state.set({ scopeKind: "instance", stateKey: pendingKey(discordUserId) }, pending);
+  await writeState(ctx, { scopeKind: "instance", stateKey: pendingKey(discordUserId) }, pending);
 }
 
 export async function getPending(
   ctx: PluginContext,
   discordUserId: string,
 ): Promise<PendingChallenge | null> {
-  const raw = await ctx.state.get({ scopeKind: "instance", stateKey: pendingKey(discordUserId) });
+  const raw = await readState(ctx, { scopeKind: "instance", stateKey: pendingKey(discordUserId) });
   return (raw as PendingChallenge | null | undefined) ?? null;
 }
 
@@ -134,18 +135,18 @@ export async function getLink(
   ctx: PluginContext,
   discordUserId: string,
 ): Promise<IdentityLink | null> {
-  const raw = await ctx.state.get({ scopeKind: "instance", stateKey: stateKey(discordUserId) });
+  const raw = await readState(ctx, { scopeKind: "instance", stateKey: stateKey(discordUserId) });
   return (raw as IdentityLink | null | undefined) ?? null;
 }
 
 export async function saveLink(ctx: PluginContext, link: IdentityLink): Promise<void> {
-  await ctx.state.set({ scopeKind: "instance", stateKey: stateKey(link.discordUserId) }, link);
+  await writeState(ctx, { scopeKind: "instance", stateKey: stateKey(link.discordUserId) }, link);
 }
 
 export async function removeLink(ctx: PluginContext, discordUserId: string): Promise<boolean> {
   const existing = await getLink(ctx, discordUserId);
   if (!existing) return false;
-  await ctx.state.set({ scopeKind: "instance", stateKey: stateKey(discordUserId) }, null);
+  await writeState(ctx, { scopeKind: "instance", stateKey: stateKey(discordUserId) }, null);
   return true;
 }
 

@@ -1,3 +1,4 @@
+import { readState, writeState } from "./safe-state.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { listCompanies } from "./host-or-rest.js";
 
@@ -20,7 +21,7 @@ export async function resolveCompanyId(
   // Check if a guild-level default was set via /clip connect — always re-read
   // so that switching companies works without a plugin restart.
   try {
-    const connected = (await ctx.state.get({ scopeKind: "instance", stateKey: "company_default" })) as { companyId?: string } | null | undefined;
+    const connected = (await readState(ctx, { scopeKind: "instance", stateKey: "company_default" })) as { companyId?: string } | null | undefined;
     if (connected?.companyId) {
       return connected.companyId;
     }

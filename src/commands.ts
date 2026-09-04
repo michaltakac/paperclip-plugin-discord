@@ -1,3 +1,4 @@
+import { readState, writeState } from "./safe-state.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { type DiscordEmbed, respondToInteraction } from "./discord-api.js";
 import { COLORS, METRIC_NAMES } from "./constants.js";
@@ -789,7 +790,7 @@ async function handleBudget(
       });
     }
 
-    const budgetState = await ctx.state.get({
+    const budgetState = await readState(ctx, {
       scopeKind: "agent",
       scopeId: agent.id,
       stateKey: "budget",
@@ -1152,7 +1153,7 @@ async function handleConnect(
       });
     }
 
-    await ctx.state.set(
+    await writeState(ctx, 
       { scopeKind: "instance", stateKey: `company_default` },
       { companyId: match.id, companyName: match.name ?? input, linkedAt: new Date().toISOString() },
     );
@@ -1198,7 +1199,7 @@ async function handleConnectChannel(
   }
 
   try {
-    const existing = (await ctx.state.get({
+    const existing = (await readState(ctx, {
       scopeKind: "instance",
       stateKey: "channel-project-map",
     })) as Record<string, string> | null;
@@ -1206,7 +1207,7 @@ async function handleConnectChannel(
     const channelMap = existing ?? {};
     channelMap[projectName.trim()] = channelId;
 
-    await ctx.state.set(
+    await writeState(ctx, 
       { scopeKind: "instance", stateKey: "channel-project-map" },
       channelMap,
     );
@@ -1238,7 +1239,7 @@ async function handleDigest(
   const stateKey = "digest-config";
 
   if (action === "status") {
-    const config = (await ctx.state.get({
+    const config = (await readState(ctx, {
       scopeKind: "instance",
       stateKey,
     })) as { mode?: string; enabled?: boolean } | null;
@@ -1263,7 +1264,7 @@ async function handleDigest(
   }
 
   if (action === "off") {
-    await ctx.state.set(
+    await writeState(ctx, 
       { scopeKind: "instance", stateKey },
       { mode: "off", enabled: false },
     );
@@ -1281,7 +1282,7 @@ async function handleDigest(
 
   if (action === "on") {
     const digestMode = mode ?? "daily";
-    await ctx.state.set(
+    await writeState(ctx, 
       { scopeKind: "instance", stateKey },
       { mode: digestMode, enabled: true },
     );
@@ -1567,7 +1568,7 @@ async function handleEscalationButton(
 
   const resolveRecord = async (resolution: string): Promise<void> => {
     record!.status = "resolved";
-    await ctx.state.set(
+    await writeState(ctx, 
       { scopeKind: "company", scopeId: companyId, stateKey: `escalation_${escalationId}` },
       {
         ...record,

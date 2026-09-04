@@ -1,3 +1,4 @@
+import { readState, writeState } from "./safe-state.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 
 // ---------------------------------------------------------------------------
@@ -33,17 +34,17 @@ export async function getEscalation(
 ): Promise<EscalationRecord | null> {
   const key = `escalation_${escalationId}`;
   if (escalationCompanyId) {
-    const raw = await ctx.state.get({ scopeKind: "company", scopeId: escalationCompanyId, stateKey: key });
+    const raw = await readState(ctx, { scopeKind: "company", scopeId: escalationCompanyId, stateKey: key });
     if (raw) return raw as EscalationRecord;
   }
   // Backward-compat fallback
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readState(ctx, { scopeKind: "company", scopeId: "default", stateKey: key });
   return (fallback as EscalationRecord) ?? null;
 }
 
 export async function saveEscalation(ctx: PluginContext, record: EscalationRecord): Promise<void> {
   const scopeId = record.companyId || "default";
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId, stateKey: `escalation_${record.escalationId}` },
     record,
   );
@@ -55,15 +56,15 @@ export async function trackPendingEscalation(
   escalationCompanyId: string = "default",
 ): Promise<void> {
   const key = "escalation_pending_ids";
-  let raw = await ctx.state.get({ scopeKind: "company", scopeId: escalationCompanyId, stateKey: key });
+  let raw = await readState(ctx, { scopeKind: "company", scopeId: escalationCompanyId, stateKey: key });
   // Backward-compat fallback for reads
   if (!raw && escalationCompanyId !== "default") {
-    raw = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+    raw = await readState(ctx, { scopeKind: "company", scopeId: "default", stateKey: key });
   }
   const ids = (raw as string[]) ?? [];
   if (!ids.includes(escalationId)) {
     ids.push(escalationId);
-    await ctx.state.set(
+    await writeState(ctx, 
       { scopeKind: "company", scopeId: escalationCompanyId, stateKey: key },
       ids,
     );
@@ -76,14 +77,14 @@ export async function untrackPendingEscalation(
   escalationCompanyId: string = "default",
 ): Promise<void> {
   const key = "escalation_pending_ids";
-  let raw = await ctx.state.get({ scopeKind: "company", scopeId: escalationCompanyId, stateKey: key });
+  let raw = await readState(ctx, { scopeKind: "company", scopeId: escalationCompanyId, stateKey: key });
   // Backward-compat fallback for reads
   if (!raw && escalationCompanyId !== "default") {
-    raw = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+    raw = await readState(ctx, { scopeKind: "company", scopeId: "default", stateKey: key });
   }
   const ids = (raw as string[]) ?? [];
   const filtered = ids.filter((id) => id !== escalationId);
-  await ctx.state.set(
+  await writeState(ctx, 
     { scopeKind: "company", scopeId: escalationCompanyId, stateKey: key },
     filtered,
   );
@@ -101,7 +102,7 @@ export async function collectPendingEscalationIds(
   const seenIds = new Set<string>();
   const pendingIds: string[] = [];
   for (const sid of scopeIds) {
-    const raw = await ctx.state.get({
+    const raw = await readState(ctx, {
       scopeKind: "company",
       scopeId: sid,
       stateKey: "escalation_pending_ids",

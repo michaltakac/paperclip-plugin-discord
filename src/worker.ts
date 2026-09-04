@@ -1,3 +1,4 @@
+import { readState, writeState } from "./safe-state.js";
 import {
   definePlugin,
   runWorker,
@@ -385,7 +386,7 @@ async function resolveChannel(
   channelMap?: Record<string, string>,
 ): Promise<string | null> {
   // 1. Explicit state override via `/clip connect-channel` (per-company set at runtime).
-  const override = await ctx.state.get({
+  const override = await readState(ctx, {
     scopeKind: "company",
     scopeId: companyId,
     stateKey: "discord-channel",
@@ -618,7 +619,7 @@ async function resolveTopicChannel(
   const projectName = payload.projectName ? String(payload.projectName) : null;
   if (!projectName) return null;
 
-  const channelMap = (await ctx.state.get({
+  const channelMap = (await readState(ctx, {
     scopeKind: "instance",
     stateKey: "channel-project-map",
   })) as Record<string, string> | null;
@@ -657,7 +658,7 @@ async function notify(
   if (messageId) {
     // Store message mapping for reply routing
     if (rt.config.enableInbound !== false) {
-      await ctx.state.set(
+      await writeState(ctx, 
         { scopeKind: "instance", stateKey: `msg_${channelId}_${messageId}` },
         {
           entityId: event.entityId,
@@ -670,7 +671,7 @@ async function notify(
       // not a reply, so it has no message to inherit a destination from; this
       // gives it "whatever this channel is currently about". Last notification
       // wins — see `voiceTargetKey` for what that means at the read side.
-      await ctx.state.set(
+      await writeState(ctx, 
         { scopeKind: "instance", stateKey: voiceTargetKey(channelId) },
         {
           entityId: event.entityId,
@@ -815,7 +816,7 @@ async function resolveInboundDestination(
   if (threadKey.startsWith("reply:")) {
     const [, channelId, messageId] = threadKey.split(":");
     if (!channelId || !messageId) return null;
-    const mapping = (await ctx.state.get({
+    const mapping = (await readState(ctx, {
       scopeKind: "instance",
       stateKey: `msg_${channelId}_${messageId}`,
     })) as InboundDestination | null;
@@ -835,7 +836,7 @@ async function resolveInboundDestination(
     // moves where the next utterance lands. Phase 1 accepts this; a real
     // conversation-scoped target needs state voice does not have yet.
     if (input.channelId) {
-      const pointer = (await ctx.state.get({
+      const pointer = (await readState(ctx, {
         scopeKind: "instance",
         stateKey: voiceTargetKey(input.channelId),
       })) as InboundDestination | null;
@@ -920,14 +921,14 @@ async function ingestInbound(
   if (mapping.entityType === "escalation") {
     // Route to escalation response
     const escalationCompanyId = mapping.companyId || "default";
-    let record = await ctx.state.get({
+    let record = await readState(ctx, {
       scopeKind: "company",
       scopeId: escalationCompanyId,
       stateKey: `escalation_${mapping.entityId}`,
     }) as EscalationRecord | null;
     // Backward-compat fallback: check "default" scope if company-scoped read returns null
     if (!record && escalationCompanyId !== "default") {
-      record = await ctx.state.get({
+      record = await readState(ctx, {
         scopeKind: "company",
         scopeId: "default",
         stateKey: `escalation_${mapping.entityId}`,
@@ -942,7 +943,7 @@ async function ingestInbound(
       record.resolvedAt = new Date().toISOString();
       record.resolvedBy = input.author;
       record.resolution = "human_reply";
-      await ctx.state.set(
+      await writeState(ctx, 
         { scopeKind: "company", scopeId: escalationCompanyId, stateKey: `escalation_${mapping.entityId}` },
         record,
       );
@@ -1820,7 +1821,7 @@ function startBackfillIfEnabled(ctx: PluginContext, rt: DiscordRuntime): void {
   rt.backfillStarted = true;
   void (async () => {
     const cid = rt.companyId;
-    const existing = await ctx.state.get({
+    const existing = await readState(ctx, {
       scopeKind: "company",
       scopeId: cid,
       stateKey: "discord_intelligence",
@@ -2014,7 +2015,7 @@ const plugin = definePlugin({
       const completionMarker = String(payload.completedAt ?? "");
       if (completionMarker) {
         const stateKey = `issue_done_notified_${event.entityId}`;
-        const previousMarker = await ctx.state.get({
+        const previousMarker = await readState(ctx, {
           scopeKind: "instance",
           stateKey,
         }) as string | null;
@@ -2022,7 +2023,7 @@ const plugin = definePlugin({
           ctx.logger.debug(`Skipping duplicate completion notification for ${event.entityId}`);
           return;
         }
-        await ctx.state.set(
+        await writeState(ctx, 
           { scopeKind: "instance", stateKey },
           completionMarker,
         );
@@ -2043,7 +2044,7 @@ const plugin = definePlugin({
         rt.config.approvalsChannels,
         async (channelId, messageId) => {
           // Store reverse mapping so decision events can update the original message
-          await ctx.state.set(
+          await writeState(ctx, 
             { scopeKind: "instance", stateKey: `approval_${event.entityId}` },
             { channelId, messageId },
           );
@@ -2055,7 +2056,7 @@ const plugin = definePlugin({
     ctx.events.on("approval.approved" as any, async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
       if (!rt || !rt.config.notifyOnApprovalCreated) return;
-      const record = await ctx.state.get({
+      const record = await readState(ctx, {
         scopeKind: "instance",
         stateKey: `approval_${event.entityId}`,
       }) as { channelId: string; messageId: string } | null;
@@ -2080,7 +2081,7 @@ const plugin = definePlugin({
     ctx.events.on("approval.rejected" as any, async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
       if (!rt || !rt.config.notifyOnApprovalCreated) return;
-      const record = await ctx.state.get({
+      const record = await readState(ctx, {
         scopeKind: "instance",
         stateKey: `approval_${event.entityId}`,
       }) as { channelId: string; messageId: string } | null;
@@ -2425,7 +2426,7 @@ const plugin = definePlugin({
         const a = agent as { id: string; name: string; status?: string };
         if (a.status && a.status !== "active") continue;
 
-        const budgetState = await ctx.state.get({
+        const budgetState = await readState(ctx, {
           scopeKind: "agent",
           scopeId: a.id,
           stateKey: "budget",
@@ -2440,7 +2441,7 @@ const plugin = definePlugin({
         if (pct < BUDGET_ALERT_THRESHOLD) continue;
 
         // Dedup: check if we already alerted for this billing cycle
-        const alertState = await ctx.state.get({
+        const alertState = await readState(ctx, {
           scopeKind: "agent",
           scopeId: a.id,
           stateKey: "budget-alert-last-sent",
@@ -2471,7 +2472,7 @@ const plugin = definePlugin({
         await postEmbed(ctx, rt.token, channelId, message);
 
         // Record that we sent the alert for this billing cycle
-        await ctx.state.set(
+        await writeState(ctx, 
           { scopeKind: "agent", scopeId: a.id, stateKey: "budget-alert-last-sent" },
           { limit, sentAt: new Date().toISOString() },
         );
@@ -2740,7 +2741,7 @@ const plugin = definePlugin({
 
     ctx.data.register("channel-mapping", async (params) => {
       const cid = String(params.companyId);
-      const saved = await ctx.state.get({
+      const saved = await readState(ctx, {
         scopeKind: "company",
         scopeId: cid,
         stateKey: "discord-channel",
@@ -2757,7 +2758,7 @@ const plugin = definePlugin({
       if (!SNOWFLAKE_ID_REGEX.test(channelId)) {
         return { ok: false, error: "Invalid channel ID - must be a snowflake string" };
       }
-      await ctx.state.set(
+      await writeState(ctx, 
         { scopeKind: "company", scopeId: cid, stateKey: "discord-channel" },
         channelId,
       );
@@ -2788,7 +2789,7 @@ const plugin = definePlugin({
       async (params, runCtx) => {
         const p = params as Record<string, unknown>;
         const cid = runCtx.companyId;
-        const raw = await ctx.state.get({
+        const raw = await readState(ctx, {
           scopeKind: "company",
           scopeId: cid,
           stateKey: "discord_intelligence",
@@ -2841,7 +2842,7 @@ const plugin = definePlugin({
       if (!rt.config.enableIntelligence || rt.intelligenceChannelIds.length === 0 || !rt.defaultGuildId) {
         return { ok: false, error: "Intelligence is disabled or no intelligence channels are configured." };
       }
-      await ctx.state.set(
+      await writeState(ctx, 
         { scopeKind: "company", scopeId: cid, stateKey: "discord_intelligence" },
         { signals: [], backfillComplete: false },
       );
