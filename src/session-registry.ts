@@ -1,4 +1,5 @@
 import { readState, writeState } from "./safe-state.js";
+import { listAgents } from "./host-or-rest.js";
 import type { PluginContext, AgentSessionEvent } from "@paperclipai/plugin-sdk";
 import type { DiscordEmbed, DiscordComponent } from "./discord-api.js";
 import { postEmbed, respondToInteraction } from "./discord-api.js";
@@ -225,12 +226,16 @@ async function resolveAgentId(
   ctx: PluginContext,
   agentName: string,
   companyId: string,
+  // /acp arrives over the gateway, where a company-scoped host call is refused;
+  // without these the lookup fails and `/acp spawn` can never find an agent.
+  baseUrl = "http://localhost:3100",
+  apiKey?: string,
 ): Promise<string | null> {
   try {
-    const agents = await ctx.agents.list({ companyId });
+    const agents = await listAgents(ctx, companyId, baseUrl, apiKey);
+    const needle = agentName.toLowerCase();
     const match = agents.find(
-      (a: { id: string; name: string }) =>
-        a.name === agentName || a.name.toLowerCase() === agentName.toLowerCase(),
+      (a) => (a.name ?? "") === agentName || (a.name ?? "").toLowerCase() === needle,
     );
     return match?.id ?? null;
   } catch {
@@ -250,6 +255,8 @@ export async function spawnAgentInThread(
   companyId: string,
   taskPrompt: string,
   maxAgents: number = MAX_AGENTS_PER_THREAD,
+  baseUrl = "http://localhost:3100",
+  apiKey?: string,
 ): Promise<{ ok: boolean; sessionId?: string; transport?: TransportKind; error?: string }> {
   const sessions = await getThreadSessions(ctx, threadId, companyId);
   const running = sessions.filter((s) => s.status === "running");
@@ -265,7 +272,7 @@ export async function spawnAgentInThread(
     return { ok: false, error: `Agent **${agentName}** is already running in this thread.` };
   }
 
-  const agentId = await resolveAgentId(ctx, agentName, companyId);
+  const agentId = await resolveAgentId(ctx, agentName, companyId, baseUrl, apiKey);
   if (!agentId) {
     return { ok: false, error: `Agent **${agentName}** not found.` };
   }
@@ -1101,6 +1108,10 @@ export async function handleAcpCommand(
   data: AcpInteractionData,
   companyId: string,
   defaultChannelId: string,
+  // Needed so agent lookup can fall back to REST: /acp arrives over the
+  // gateway, where a company-scoped host call is refused.
+  baseUrl = "http://localhost:3100",
+  apiKey?: string,
 ): Promise<unknown> {
   const subcommand = data.options?.[0];
   if (!subcommand) {
@@ -1120,7 +1131,10 @@ export async function handleAcpCommand(
         return respondToInteraction({ type: 4, content: "Failed to create Discord thread.", ephemeral: true });
       }
 
-      const result = await spawnAgentInThread(ctx, token, threadId, agentName, companyId, task);
+      const result = await spawnAgentInThread(
+        ctx, token, threadId, agentName, companyId, task,
+        MAX_AGENTS_PER_THREAD, baseUrl, apiKey,
+      );
       if (!result.ok) {
         return respondToInteraction({ type: 4, content: result.error ?? "Failed to spawn agent.", ephemeral: true });
       }

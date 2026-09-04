@@ -78,6 +78,13 @@ export type IssueRow = {
   assigneeAgentId?: string | null;
   executionAgentNameKey?: string | null;
   project?: { name?: string } | null;
+  /**
+   * Only the host SDK supplies this. The REST payload has no equivalent —
+   * `unblockDescriptor` and `blockerAttention` are different things — so a
+   * blocked-issue list read over REST simply omits the reason rather than
+   * inventing one.
+   */
+  blockerReason?: string;
 };
 export type CompanyRow = { id: string; name?: string };
 export type ProjectRow = { id: string; name?: string; status?: string; description?: string | null };
@@ -157,5 +164,24 @@ export function listProjects(
         await restJson(baseUrl, `/api/companies/${companyId}/projects?limit=${limit}`, apiKey),
         "projects",
       ),
+  );
+}
+
+export function getIssue(
+  ctx: PluginContext,
+  issueId: string,
+  companyId: string,
+  baseUrl: string,
+  apiKey?: string,
+): Promise<IssueRow | null> {
+  return sdkOrRest(
+    () => ctx.issues.get(issueId, companyId) as Promise<IssueRow | null>,
+    async () => {
+      try {
+        return (await restJson<IssueRow>(baseUrl, `/api/issues/${encodeURIComponent(issueId)}`, apiKey)) ?? null;
+      } catch {
+        return null; // a missing issue is a null, not an error
+      }
+    },
   );
 }

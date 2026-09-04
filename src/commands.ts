@@ -12,7 +12,7 @@ import {
   savePending,
   tryCompleteLink,
 } from "./identity.js";
-import { listAgents, listCompanies, listIssues, listProjects } from "./host-or-rest.js";
+import { getIssue, listAgents, listCompanies, listIssues, listProjects } from "./host-or-rest.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
 import { resolveCompanyId } from "./company-resolver.js";
@@ -466,6 +466,8 @@ async function handleSlashCommand(
       data,
       companyId,
       cmdCtx?.defaultChannelId ?? "",
+      cmdCtx?.baseUrl,
+      cmdCtx?.paperclipBoardApiKey,
     );
   }
 
@@ -872,6 +874,18 @@ async function handleIssues(
     // object — otherwise it would drop everything the server just returned.
     const canFilterByName =
       !projectId && Boolean(projectFilter) && all.some((i) => i.project?.name);
+
+    // A filter we could neither resolve to a project nor apply by name would
+    // silently return EVERY issue under that project's heading — worse than an
+    // error, because it looks like a real answer. Say so instead.
+    if (projectFilter && !projectId && !canFilterByName) {
+      return respondToInteraction({
+        type: 4,
+        content: `Project "${projectFilter}" not found. Try \`/clip projects\` to see the list.`,
+        ephemeral: true,
+      });
+    }
+
     const issues = canFilterByName
       ? all.filter((i) => (i.project?.name ?? "").toLowerCase().includes(projectFilter!.toLowerCase()))
       : all;
@@ -1501,8 +1515,8 @@ async function handleButtonClick(
     const issueId = customId.replace("issue_assign_", "");
     ctx.logger.info("Assign to Me button clicked", { issueId, actor });
     try {
-      const issueCompanyId = await resolveIssueCompanyId(ctx, issueId);
-      const issue = await ctx.issues.get(issueId, issueCompanyId) as {
+      const issueCompanyId = await resolveIssueCompanyId(ctx, issueId, base, apiKey);
+      const issue = (await getIssue(ctx, issueId, issueCompanyId, base, apiKey)) as {
         assigneeUserId?: string | null;
         assigneeAgentId?: string | null;
       } | null;
@@ -1535,13 +1549,13 @@ async function handleButtonClick(
     const companyId = customId.replace("digest_blocked_", "");
     ctx.logger.info("View Blocked button clicked", { companyId, actor });
     try {
-      const issues = await ctx.issues.list({ companyId, status: "blocked", limit: 20 });
+      const issues = await listIssues(ctx, companyId, base, apiKey, { status: "blocked", limit: 20 });
       if (issues.length === 0) {
         return respondToInteraction({ type: 4, content: "No blocked issues found.", ephemeral: true });
       }
-      const lines = issues.map((i: { identifier?: string | null; id: string; title: string; blockerReason?: string }) => {
+      const lines = issues.map((i) => {
         const reason = i.blockerReason ? `\n  → ${i.blockerReason}` : "";
-        return `• **${i.identifier ?? i.id}** — ${i.title}${reason}`;
+        return `• **${i.identifier ?? i.id}** — ${i.title ?? "(untitled)"}${reason}`;
       });
       return respondToInteraction({ type: 4, content: `🚫 **Blocked Issues (${issues.length})**\n\n${lines.join("\n").slice(0, 1900)}`, ephemeral: true });
     } catch (err) {
@@ -1708,7 +1722,7 @@ async function resolveIssueCompanyId(
 ): Promise<string> {
   const companies = await listCompanies(ctx, api, apiKey);
   for (const company of companies) {
-    const issue = await ctx.issues.get(issueId, company.id);
+    const issue = await getIssue(ctx, issueId, company.id, api, apiKey);
     if (issue) return company.id;
   }
   throw new Error(`Issue not found: ${issueId}`);
