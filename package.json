@@ -1,6 +1,6 @@
 {
   "name": "paperclip-plugin-discord",
-  "version": "0.11.0",
+  "version": "0.11.0-ordillect.1",
   "type": "module",
   "main": "./dist/index.js",
   "paperclipPlugin": {
@@ -61,5 +61,6 @@
     "type": "git",
     "url": "git+https://github.com/mvanhorn/paperclip-plugin-discord.git"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "description": "Ordillect fork of paperclip-plugin-discord: per-user Paperclip identity linking, mention suppression, and privileged-command gating."
 }
