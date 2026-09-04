@@ -80,6 +80,7 @@ export type IssueRow = {
   project?: { name?: string } | null;
 };
 export type CompanyRow = { id: string; name?: string };
+export type ProjectRow = { id: string; name?: string; status?: string; description?: string | null };
 
 export function listAgents(
   ctx: PluginContext,
@@ -133,5 +134,27 @@ export function listCompanies(
   return sdkOrRest(
     () => ctx.companies.list() as Promise<CompanyRow[]>,
     async () => asList<CompanyRow>(await restJson(baseUrl, `/api/companies`, apiKey), "companies"),
+  );
+}
+
+export function listProjects(
+  ctx: PluginContext,
+  companyId: string,
+  baseUrl: string,
+  apiKey?: string,
+  limit = 100,
+): Promise<ProjectRow[]> {
+  return sdkOrRest(
+    () =>
+      (
+        ctx as unknown as {
+          projects: { list(a: { companyId: string; limit: number }): Promise<ProjectRow[]> };
+        }
+      ).projects.list({ companyId, limit }),
+    async () =>
+      asList<ProjectRow>(
+        await restJson(baseUrl, `/api/companies/${companyId}/projects?limit=${limit}`, apiKey),
+        "projects",
+      ),
   );
 }

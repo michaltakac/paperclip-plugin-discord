@@ -11,7 +11,7 @@ import {
   savePending,
   tryCompleteLink,
 } from "./identity.js";
-import { listAgents, listCompanies, listIssues } from "./host-or-rest.js";
+import { listAgents, listCompanies, listIssues, listProjects } from "./host-or-rest.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
 import { resolveCompanyId } from "./company-resolver.js";
@@ -539,7 +539,13 @@ async function handleSlashCommand(
     case "companies":
       return handleCompanies(ctx, cmdCtx?.baseUrl, cmdCtx?.paperclipBoardApiKey);
     case "projects":
-      return handleProjects(ctx, companyId, getOption(subcommand.options ?? [], "company"));
+      return handleProjects(
+        ctx,
+        companyId,
+        getOption(subcommand.options ?? [], "company"),
+        cmdCtx?.baseUrl,
+        cmdCtx?.paperclipBoardApiKey,
+      );
     case "help":
       return handleHelp();
     case "connect":
@@ -605,10 +611,14 @@ async function handleAutocomplete(
     }
 
     if (focusedOption.name === "project") {
-      const companyId = cmdCtx?.pluginCtx
-        ? await resolveCompanyId(cmdCtx.pluginCtx)
-        : (cmdCtx?.companyId ?? "default");
-      const projects = await ctx.projects.list({ companyId, limit: 100 });
+      const resolvedForAutocomplete = cmdCtx?.pluginCtx
+        ? await resolveCompanyId(cmdCtx.pluginCtx, cmdCtx.baseUrl, cmdCtx.paperclipBoardApiKey)
+        : "default";
+      const companyId =
+        resolvedForAutocomplete !== "default"
+          ? resolvedForAutocomplete
+          : (cmdCtx?.companyId ?? "default");
+      const projects = await listProjects(ctx, companyId, api, apiKey);
       const filtered = projects
         .filter((p) => {
           const name = (p.name ?? p.id).toLowerCase();
@@ -1017,10 +1027,7 @@ async function handleProjects(
       companyLabel = match.name ?? match.id;
     }
 
-    const projects = (await ctx.projects.list({
-      companyId: resolvedCompanyId,
-      limit: 100,
-    })) as Array<{
+    const projects = (await listProjects(ctx, resolvedCompanyId, api, apiKey)) as Array<{
       id: string;
       name?: string;
       status?: string;
