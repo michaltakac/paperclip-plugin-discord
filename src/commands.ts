@@ -11,6 +11,7 @@ import {
   savePending,
   tryCompleteLink,
 } from "./identity.js";
+import { listAgents, listCompanies, listIssues } from "./host-or-rest.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
 import { resolveCompanyId } from "./company-resolver.js";
@@ -486,7 +487,7 @@ async function handleSlashCommand(
 
   switch (subName) {
     case "status":
-      return handleStatus(ctx, companyId);
+      return handleStatus(ctx, companyId, cmdCtx?.baseUrl, cmdCtx?.paperclipBoardApiKey);
     case "approve":
       return handleApprove(
         ctx,
@@ -497,13 +498,31 @@ async function handleSlashCommand(
         member?.user.id,
       );
     case "budget":
-      return handleBudget(ctx, getOption(subcommand.options ?? [], "agent"), companyId);
+      return handleBudget(
+        ctx,
+        getOption(subcommand.options ?? [], "agent"),
+        companyId,
+        cmdCtx?.baseUrl,
+        cmdCtx?.paperclipBoardApiKey,
+      );
     case "issues":
-      return handleIssues(ctx, companyId, getOption(subcommand.options ?? [], "project"), baseUrl);
+      return handleIssues(
+        ctx,
+        companyId,
+        getOption(subcommand.options ?? [], "project"),
+        baseUrl,
+        cmdCtx?.paperclipBoardApiKey,
+      );
     case "agents":
-      return handleAgents(ctx, companyId, getOption(subcommand.options ?? [], "company"), cmdCtx?.baseUrl);
+      return handleAgents(
+        ctx,
+        companyId,
+        getOption(subcommand.options ?? [], "company"),
+        cmdCtx?.baseUrl,
+        cmdCtx?.paperclipBoardApiKey,
+      );
     case "companies":
-      return handleCompanies(ctx);
+      return handleCompanies(ctx, cmdCtx?.baseUrl, cmdCtx?.paperclipBoardApiKey);
     case "projects":
       return handleProjects(ctx, companyId, getOption(subcommand.options ?? [], "company"));
     case "help":
@@ -539,6 +558,8 @@ async function handleAutocomplete(
   ctx: PluginContext,
   data: InteractionData,
   cmdCtx?: CommandContext,
+  api = "http://localhost:3100",
+  apiKey?: string,
 ): Promise<unknown> {
   const subcommand = data.options?.[0];
   if (!subcommand) return { type: 8, data: { choices: [] } };
@@ -550,7 +571,7 @@ async function handleAutocomplete(
 
   try {
     if (focusedOption.name === "company") {
-      const companies = await ctx.companies.list();
+      const companies = await listCompanies(ctx, api, apiKey);
       const filtered = companies
         .filter((c: { id: string; name?: string }) => {
           const name = (c.name ?? c.id).toLowerCase();
@@ -596,12 +617,17 @@ async function handleAutocomplete(
   return { type: 8, data: { choices: [] } };
 }
 
-async function handleStatus(ctx: PluginContext, companyId: string): Promise<unknown> {
+async function handleStatus(
+  ctx: PluginContext,
+  companyId: string,
+  api = "http://localhost:3100",
+  apiKey?: string,
+): Promise<unknown> {
   try {
     const [allAgents, activeIssues, doneIssues] = await Promise.all([
-      ctx.agents.list({ companyId }),
-      ctx.issues.list({ companyId, status: "in_progress", limit: 10 }),
-      ctx.issues.list({ companyId, status: "done", limit: 5 }),
+      listAgents(ctx, companyId, api, apiKey),
+      listIssues(ctx, companyId, api, apiKey, { status: "in_progress", limit: 10 }),
+      listIssues(ctx, companyId, api, apiKey, { status: "done", limit: 5 }),
     ]);
 
     const agents = allAgents.filter(
@@ -710,6 +736,8 @@ async function handleBudget(
   ctx: PluginContext,
   agentQuery: string | undefined,
   companyId: string,
+  api = "http://localhost:3100",
+  apiKey?: string,
 ): Promise<unknown> {
   if (!agentQuery) {
     return respondToInteraction({
@@ -720,11 +748,12 @@ async function handleBudget(
   }
 
   try {
-    const agents = await ctx.agents.list({ companyId });
+    const agents = await listAgents(ctx, companyId, api, apiKey);
     const agent = agents.find(
-      (a: { id: string; name: string }) =>
-        a.id === agentQuery || a.name === agentQuery ||
-        a.name.toLowerCase() === agentQuery.toLowerCase(),
+      (a) =>
+        a.id === agentQuery ||
+        a.name === agentQuery ||
+        (a.name ?? "").toLowerCase() === agentQuery.toLowerCase(),
     );
 
     if (!agent) {
@@ -777,9 +806,11 @@ async function handleIssues(
   companyId: string,
   projectFilter?: string,
   baseUrl?: string,
+  apiKey?: string,
 ): Promise<unknown> {
+  const api = baseUrl ?? "http://localhost:3100";
   try {
-    const issues = await ctx.issues.list({ companyId, limit: 10 });
+    const issues = await listIssues(ctx, companyId, api, apiKey, { limit: 10 });
     const filtered = projectFilter
       ? issues.filter((i: { project?: { name?: string } | null }) => {
           const projName = i.project?.name ?? "";
@@ -834,13 +865,15 @@ async function handleAgents(
   companyId: string,
   companyFilter?: string,
   baseUrl?: string,
+  apiKey?: string,
 ): Promise<unknown> {
+  const api = baseUrl ?? "http://localhost:3100";
   try {
     let resolvedCompanyId = companyId;
     let companyLabel: string | undefined;
 
     if (companyFilter) {
-      const companies = await ctx.companies.list();
+      const companies = await listCompanies(ctx, api, apiKey);
       const match = companies.find(
         (c: { id: string; name?: string }) =>
           c.id === companyFilter || c.name?.toLowerCase() === companyFilter.toLowerCase(),
@@ -857,7 +890,7 @@ async function handleAgents(
       companyLabel = match.name ?? match.id;
     }
 
-    const agents = await ctx.agents.list({ companyId: resolvedCompanyId });
+    const agents = await listAgents(ctx, resolvedCompanyId, api, apiKey);
 
     if (agents.length === 0) {
       const suffix = companyLabel ? ` for ${companyLabel}` : "";
@@ -903,9 +936,13 @@ async function handleAgents(
   }
 }
 
-async function handleCompanies(ctx: PluginContext): Promise<unknown> {
+async function handleCompanies(
+  ctx: PluginContext,
+  api = "http://localhost:3100",
+  apiKey?: string,
+): Promise<unknown> {
   try {
-    const companies = await ctx.companies.list();
+    const companies = await listCompanies(ctx, api, apiKey);
 
     if (companies.length === 0) {
       return respondToInteraction({ type: 4, content: "No companies found.", ephemeral: true });
@@ -940,13 +977,15 @@ async function handleProjects(
   ctx: PluginContext,
   companyId: string,
   companyFilter?: string,
+  api = "http://localhost:3100",
+  apiKey?: string,
 ): Promise<unknown> {
   try {
     let resolvedCompanyId = companyId;
     let companyLabel: string | undefined;
 
     if (companyFilter) {
-      const companies = await ctx.companies.list();
+      const companies = await listCompanies(ctx, api, apiKey);
       const match = companies.find(
         (c: { id: string; name?: string }) =>
           c.id === companyFilter || c.name?.toLowerCase() === companyFilter.toLowerCase(),
@@ -1053,10 +1092,12 @@ function handleHelp(): unknown {
 async function handleConnect(
   ctx: PluginContext,
   companyArg?: string,
+  api = "http://localhost:3100",
+  apiKey?: string,
 ): Promise<unknown> {
   if (!companyArg?.trim()) {
     try {
-      const companies = await ctx.companies.list();
+      const companies = await listCompanies(ctx, api, apiKey);
       const names = companies.map((c: { name?: string; id: string }) => c.name || c.id).join(", ");
       return respondToInteraction({
         type: 4,
@@ -1074,7 +1115,7 @@ async function handleConnect(
 
   try {
     const input = companyArg.trim();
-    const companies = await ctx.companies.list();
+    const companies = await listCompanies(ctx, api, apiKey);
     const match = companies.find(
       (c: { id: string; name?: string }) =>
         c.id === input || c.name?.toLowerCase() === input.toLowerCase(),
@@ -1606,8 +1647,10 @@ async function handleEscalationButton(
 async function resolveIssueCompanyId(
   ctx: PluginContext,
   issueId: string,
+  api = "http://localhost:3100",
+  apiKey?: string,
 ): Promise<string> {
-  const companies = await ctx.companies.list();
+  const companies = await listCompanies(ctx, api, apiKey);
   for (const company of companies) {
     const issue = await ctx.issues.get(issueId, company.id);
     if (issue) return company.id;
