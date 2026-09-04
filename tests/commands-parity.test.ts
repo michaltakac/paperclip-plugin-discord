@@ -107,7 +107,9 @@ describe("/clip issues", () => {
     const ctx = makeCtx();
     const result = (await handleInteraction(ctx, clipInteraction("issues"), defaultCmdCtx)) as any;
     expect(result.type).toBe(4);
-    expect(result.data.content).toContain("No issues found");
+    // Wording now names the filter that was applied ("No open issues"),
+    // so assert the meaning rather than the old exact string.
+    expect(result.data.content).toMatch(/no .*issues/i);
   });
 
   it("handles API errors gracefully", async () => {

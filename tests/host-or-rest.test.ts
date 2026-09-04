@@ -5,6 +5,7 @@ import {
   listAgents,
   listIssues,
   OPEN_ISSUE_STATUSES,
+  resolveStatusFilter,
 } from "../src/host-or-rest.js";
 
 // ---------------------------------------------------------------------------
@@ -132,5 +133,26 @@ describe("open-issue filtering", () => {
     expect(out.map((r) => r.identifier)).toEqual(["A-1"]);
     // and it must widen the fetch, or a page of finished work returns empty
     expect(ctx.issues.list.mock.calls[0]![0].limit).toBeGreaterThanOrEqual(100);
+  });
+});
+
+describe("resolveStatusFilter", () => {
+  it("defaults to open, and understands all/closed", () => {
+    expect(resolveStatusFilter(undefined)!.statuses).toEqual(OPEN_ISSUE_STATUSES);
+    expect(resolveStatusFilter("")!.label).toBe("Open");
+    expect(resolveStatusFilter("all")!.statuses).toHaveLength(7);
+    expect(resolveStatusFilter("closed")!.statuses).toEqual(["done", "cancelled"]);
+  });
+
+  it("accepts a single status, with or without an underscore", () => {
+    expect(resolveStatusFilter("in_progress")!.statuses).toEqual(["in_progress"]);
+    expect(resolveStatusFilter("in progress")!.statuses).toEqual(["in_progress"]);
+    expect(resolveStatusFilter("DONE")!.statuses).toEqual(["done"]);
+  });
+
+  it("returns null for nonsense rather than silently listing everything", () => {
+    // The failure mode this avoids: an unrecognised filter falling through to
+    // no filter, which looks like a real answer.
+    expect(resolveStatusFilter("bogus")).toBeNull();
   });
 });

@@ -117,6 +117,32 @@ export const OPEN_ISSUE_STATUSES: IssueStatus[] = [
   "todo", "in_progress", "in_review", "blocked", "backlog",
 ];
 
+export const CLOSED_ISSUE_STATUSES: IssueStatus[] = ["done", "cancelled"];
+
+export const ALL_ISSUE_STATUSES: IssueStatus[] = [
+  ...OPEN_ISSUE_STATUSES,
+  ...CLOSED_ISSUE_STATUSES,
+];
+
+/**
+ * Map the `status:` option to a status set.
+ *
+ * `open` (the default) and `all` are the two people actually want; the rest let
+ * a single status be named. Returns null for an unrecognised value so the
+ * caller can say so rather than silently listing everything — the failure mode
+ * that made an unknown project look like a real answer.
+ */
+export function resolveStatusFilter(
+  raw: string | undefined,
+): { statuses: IssueStatus[]; label: string } | null {
+  const value = (raw ?? "open").trim().toLowerCase();
+  if (!value || value === "open") return { statuses: OPEN_ISSUE_STATUSES, label: "Open" };
+  if (value === "all" || value === "any") return { statuses: ALL_ISSUE_STATUSES, label: "All" };
+  if (value === "closed") return { statuses: CLOSED_ISSUE_STATUSES, label: "Closed" };
+  const one = ALL_ISSUE_STATUSES.find((s) => s === value || s.replace(/_/g, " ") === value);
+  return one ? { statuses: [one], label: one.replace(/_/g, " ") } : null;
+}
+
 export function listIssues(
   ctx: PluginContext,
   companyId: string,

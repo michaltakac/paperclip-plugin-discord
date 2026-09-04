@@ -13,12 +13,14 @@ import {
   tryCompleteLink,
 } from "./identity.js";
 import {
+  ALL_ISSUE_STATUSES,
   getIssue,
   listAgents,
   listCompanies,
   listIssues,
   listProjects,
   OPEN_ISSUE_STATUSES,
+  resolveStatusFilter,
 } from "./host-or-rest.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
@@ -162,7 +164,7 @@ export const SLASH_COMMANDS = [
       },
       {
         name: "issues",
-        description: "List open issues with optional project filter",
+        description: "List issues (open by default) with optional project filter",
         type: 1,
         options: [
           {
@@ -171,6 +173,24 @@ export const SLASH_COMMANDS = [
             type: 3,
             required: false,
             autocomplete: true,
+          },
+          {
+            name: "status",
+            description: "open (default), all, closed, or one status",
+            type: 3,
+            required: false,
+            choices: [
+              { name: "open", value: "open" },
+              { name: "all", value: "all" },
+              { name: "closed", value: "closed" },
+              { name: "todo", value: "todo" },
+              { name: "in progress", value: "in_progress" },
+              { name: "in review", value: "in_review" },
+              { name: "blocked", value: "blocked" },
+              { name: "backlog", value: "backlog" },
+              { name: "done", value: "done" },
+              { name: "cancelled", value: "cancelled" },
+            ],
           },
         ],
       },
@@ -537,6 +557,7 @@ async function handleSlashCommand(
         getOption(subcommand.options ?? [], "project"),
         baseUrl,
         cmdCtx?.paperclipBoardApiKey,
+        getOption(subcommand.options ?? [], "status"),
       );
     case "agents":
       return handleAgents(
@@ -842,6 +863,7 @@ async function handleIssues(
   projectFilter?: string,
   baseUrl?: string,
   apiKey?: string,
+  statusFilter?: string,
 ): Promise<unknown> {
   const api = baseUrl ?? "http://localhost:3100";
   try {
@@ -873,10 +895,19 @@ async function handleIssues(
       }
     }
 
+    const wanted = resolveStatusFilter(statusFilter);
+    if (!wanted) {
+      return respondToInteraction({
+        type: 4,
+        content: `Unknown status "${statusFilter}". Use open, all, closed, or one of: ${ALL_ISSUE_STATUSES.join(", ")}.`,
+        ephemeral: true,
+      });
+    }
+
     const all = await listIssues(ctx, companyId, api, apiKey, {
       limit: 10,
       projectId,
-      statuses: OPEN_ISSUE_STATUSES,
+      statuses: wanted.statuses,
     });
 
     // Client-side name filter, kept for the host-SDK shape, which carries a
@@ -902,10 +933,37 @@ async function handleIssues(
       : all;
 
     if (issues.length === 0) {
-      const suffix = projectFilter ? ` for project "${projectLabel ?? projectFilter}"` : "";
+      const where = projectFilter ? ` in **${projectLabel ?? projectFilter}**` : "";
+      // "No issues found" is ambiguous between "nothing matches" and "something
+      // is broken". Counting what the filter excluded distinguishes the two,
+      // and points at the option that would show it.
+      let context = "";
+      if (wanted.statuses !== ALL_ISSUE_STATUSES) {
+        try {
+          const others = await listIssues(ctx, companyId, api, apiKey, {
+            limit: 100,
+            projectId,
+            statuses: ALL_ISSUE_STATUSES.filter((st) => !wanted.statuses.includes(st)),
+          });
+          if (others.length > 0) {
+            const counts = others.reduce<Record<string, number>>((acc, i) => {
+              acc[i.status] = (acc[i.status] ?? 0) + 1;
+              return acc;
+            }, {});
+            const summary = Object.entries(counts)
+              .map(([st, n]) => `${n} ${humanizeStatus(st).toLowerCase()}`)
+              .join(", ");
+            context =
+              `\n${others.length} other issue${others.length === 1 ? "" : "s"}${where ? "" : ""}` +
+              ` (${summary}) — see them with \`status:all\`.`;
+          }
+        } catch {
+          // Context is a nicety; never fail the command for it.
+        }
+      }
       return respondToInteraction({
         type: 4,
-        content: `No issues found${suffix}.`,
+        content: `No ${wanted.label.toLowerCase()} issues${where}.${context}`,
         ephemeral: true,
       });
     }
@@ -927,7 +985,7 @@ async function handleIssues(
     return respondToInteraction({
       type: 4,
       embeds: [{
-        title: `Open Issues${projectFilter ? ` (${projectLabel ?? projectFilter})` : ""}`,
+        title: `${wanted.label} Issues${projectFilter ? ` (${projectLabel ?? projectFilter})` : ""}`,
         color: COLORS.BLUE,
         fields,
         footer: { text: "Paperclip" },
