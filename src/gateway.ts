@@ -1,11 +1,13 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { DISCORD_API_BASE, METRIC_NAMES } from "./constants.js";
+import type { ReactionAddEvent } from "./memory-capture.js";
 
 const GATEWAY_VERSION = "10";
 const GATEWAY_ENCODING = "json";
 const GUILD_INTENT = 1;
 const GUILD_VOICE_STATES_INTENT = 128;
 const GUILD_MESSAGES_INTENT = 512;
+const GUILD_MESSAGE_REACTIONS_INTENT = 1024;
 const MESSAGE_CONTENT_INTENT = 32768;
 
 // --- Reconnect policy tuning (exported for tests) ---
@@ -103,6 +105,7 @@ export interface GatewaySendPayload {
 
 type InteractionHandler = (interaction: InteractionCreateEvent) => Promise<unknown>;
 type MessageHandler = (message: MessageCreateEvent) => Promise<void>;
+type ReactionHandler = (event: ReactionAddEvent) => Promise<void>;
 type VoiceStateUpdateHandler = (event: VoiceStateUpdateEvent) => void;
 type VoiceServerUpdateHandler = (event: VoiceServerUpdateEvent) => void;
 type GatewayReadyHandler = () => void;
@@ -154,6 +157,12 @@ export interface GatewayHandle {
 export interface GatewayOptions {
   listenForMessages?: boolean;
   includeMessageContent?: boolean;
+  /**
+   * Add the GUILD_MESSAGE_REACTIONS intent (not privileged) and dispatch
+   * MESSAGE_REACTION_ADD to this handler. The event carries no message content.
+   * Omitted — no intent, no dispatch, no behaviour change.
+   */
+  onReaction?: ReactionHandler;
   /**
    * Add the GUILD_VOICE_STATES intent and dispatch VOICE_STATE_UPDATE /
    * VOICE_SERVER_UPDATE to subscribers via the returned `voice` handle.
@@ -310,7 +319,8 @@ export async function connectGateway(
     GUILD_INTENT |
     (enableVoice ? GUILD_VOICE_STATES_INTENT : 0) |
     (listenForMessages ? GUILD_MESSAGES_INTENT : 0) |
-    (includeMessageContent ? MESSAGE_CONTENT_INTENT : 0);
+    (includeMessageContent ? MESSAGE_CONTENT_INTENT : 0) |
+    (options.onReaction ? GUILD_MESSAGE_REACTIONS_INTENT : 0);
 
   // Voice dispatch subscribers. Sets (not arrays) so subscribers can be removed
   // when a voice connection is destroyed — a leaked handler would keep firing
@@ -647,6 +657,16 @@ export async function connectGateway(
               await onMessage(message);
             } catch (error) {
               ctx.logger.error("Gateway message handler error", {
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+
+          if (payload.t === "MESSAGE_REACTION_ADD" && options.onReaction) {
+            try {
+              await options.onReaction(payload.d as ReactionAddEvent);
+            } catch (error) {
+              ctx.logger.error("Gateway reaction handler error", {
                 error: error instanceof Error ? error.message : String(error),
               });
             }

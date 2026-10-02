@@ -59,6 +59,12 @@ import {
 } from "./runtime-token.js";
 
 import {
+  DEFAULT_CAPTURE_EMOJI,
+  DEFAULT_CAPTURE_INSTRUCTIONS,
+  type ReactionAddEvent,
+  handleCaptureReaction,
+} from "./memory-capture.js";
+import {
   type EscalationRecord,
   getEscalation,
   saveEscalation,
@@ -107,6 +113,13 @@ type DiscordConfig = {
   proactiveScanIntervalMinutes: number;
   enableCommands: boolean;
   enableInbound: boolean;
+  /** React with `memoryCaptureEmoji` to file a message for agent memory. */
+  enableMemoryCapture?: boolean;
+  memoryCaptureEmoji?: string;
+  memoryCaptureChannelIds?: string[] | string;
+  memoryCaptureProjectId?: string;
+  memoryCaptureAssigneeAgentId?: string;
+  memoryCaptureInstructions?: string;
   topicRouting: boolean;
   digestMode: string;
   dailyDigestTime: string;
@@ -270,6 +283,8 @@ type DiscordRuntime = {
    * fixed at identify time, so a change here needs a reconnect.
    */
   listenForMessages: boolean;
+  /** Same, for the reaction intent that memory capture needs. */
+  listenForReactions: boolean;
   /** Same, for the voice-state intent: voice cannot be added to a live socket. */
   voiceEnabled: boolean;
   /** The first-install backfill runs at most once per runtime. */
@@ -1035,6 +1050,40 @@ async function handleMessageCreate(
   });
 }
 
+/**
+ * A reaction was added somewhere the bot can see. The only reaction this
+ * plugin acts on is the memory-capture emoji; everything else is dropped in
+ * `handleCaptureReaction` before any network call.
+ *
+ * Settings are read from the runtime on every event, so a config save takes
+ * effect on a reused gateway connection.
+ */
+async function handleReactionAdd(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  event: ReactionAddEvent,
+): Promise<void> {
+  if (rt.config.enableMemoryCapture !== true) return;
+  await handleCaptureReaction(
+    ctx,
+    {
+      token: rt.token,
+      companyId: rt.companyId,
+      baseUrl: rt.baseUrl,
+      paperclipBoardApiKey: rt.paperclipBoardApiKey,
+      guildId: rt.defaultGuildId,
+      emoji: (rt.config.memoryCaptureEmoji ?? "").trim() || DEFAULT_CAPTURE_EMOJI,
+      channelIds: normalizeIdList(rt.config.memoryCaptureChannelIds),
+      projectId: normalizeDiscordId(rt.config.memoryCaptureProjectId),
+      assigneeAgentId: normalizeDiscordId(rt.config.memoryCaptureAssigneeAgentId),
+      instructions: (rt.config.memoryCaptureInstructions ?? "").trim() || DEFAULT_CAPTURE_INSTRUCTIONS,
+      adminUserIds: rt.cmdCtx.adminUserIds ?? [],
+      adminRoleIds: rt.cmdCtx.adminRoleIds ?? [],
+    },
+    event,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Runtime bootstrap
 // ---------------------------------------------------------------------------
@@ -1284,6 +1333,7 @@ async function bootstrapRuntime(
   const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
   const defaultGuildId = normalizeDiscordId(config.defaultGuildId);
   const listenForMessages = gatewayNeedsMessages(config);
+  const listenForReactions = config.enableMemoryCapture === true;
   const voiceEnv = readVoiceEnv();
   const voiceEnabled = voiceEnv !== null;
 
@@ -1296,6 +1346,7 @@ async function bootstrapRuntime(
       !existing.gatewayFailed &&
       existing.token === token &&
       existing.listenForMessages === listenForMessages &&
+      existing.listenForReactions === listenForReactions &&
       existing.voiceEnabled === voiceEnabled,
   );
 
@@ -1344,6 +1395,7 @@ async function bootstrapRuntime(
   rt.escalationTimeoutMs = (config.escalationTimeoutMinutes || 30) * 60 * 1000;
   rt.digestMode = config.digestMode ?? "off";
   rt.listenForMessages = listenForMessages;
+  rt.listenForReactions = listenForReactions;
   rt.voiceEnabled = voiceEnabled;
   rt.voice = rt.voice ?? null;
 
@@ -1433,6 +1485,12 @@ async function bootstrapRuntime(
         {
           listenForMessages,
           includeMessageContent: listenForMessages,
+          onReaction: listenForReactions
+            ? async (event) => {
+                const current = runtime;
+                if (current) await handleReactionAdd(ctx, current, event);
+              }
+            : undefined,
           enableVoice: voiceEnabled,
           // Fatal close codes and identify-budget exhaustion stop the gateway
           // permanently; report it through plugin health instead of running

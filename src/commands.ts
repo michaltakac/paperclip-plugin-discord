@@ -106,7 +106,7 @@ const PRIVILEGED_SUBCOMMANDS = new Set([
  */
 export function isPrivilegedActor(
   member: { user: { id?: string }; roles?: string[] } | undefined,
-  cmdCtx?: CommandContext,
+  cmdCtx?: Pick<CommandContext, "adminUserIds" | "adminRoleIds">,
 ): boolean {
   const users = cmdCtx?.adminUserIds ?? [];
   const roles = cmdCtx?.adminRoleIds ?? [];

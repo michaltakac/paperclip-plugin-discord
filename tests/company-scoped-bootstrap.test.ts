@@ -697,6 +697,28 @@ describe("re-bootstrap on configuration changes", () => {
     expect(liveGateways()).toHaveLength(1);
   });
 
+  it("reconnects when memory capture is switched, since the reaction intent is fixed at identify", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
+    expect(gatewayConnects).toHaveLength(1);
+    expect(gatewayConnects[0].options.onReaction).toBeUndefined();
+
+    await host.deliver(COMPANY_A, storedConfig({ enableMemoryCapture: true }));
+    expect(gatewayConnects).toHaveLength(2);
+    expect(gatewayConnects[1].options.onReaction).toBeTypeOf("function");
+    expect(liveGateways()).toHaveLength(1);
+
+    // A setting that does not change the intents keeps the connection.
+    await host.deliver(COMPANY_A, storedConfig({ enableMemoryCapture: true, memoryCaptureEmoji: "📌" }));
+    expect(gatewayConnects).toHaveLength(2);
+
+    await host.deliver(COMPANY_A, storedConfig({ enableMemoryCapture: false }));
+    expect(gatewayConnects).toHaveLength(3);
+    expect(gatewayConnects[2].options.onReaction).toBeUndefined();
+    expect(liveGateways()).toHaveLength(1);
+  });
+
   it("tears the gateway down and reconnects when the bot token changes", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
