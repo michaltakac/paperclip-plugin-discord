@@ -225,6 +225,84 @@ describe("connectGateway", () => {
   });
 });
 
+describe("reaction intent", () => {
+  let originalWebSocket: typeof globalThis.WebSocket;
+  beforeEach(() => {
+    originalWebSocket = globalThis.WebSocket;
+  });
+  afterEach(() => {
+    globalThis.WebSocket = originalWebSocket;
+  });
+
+  class FakeWebSocket {
+    static instances: FakeWebSocket[] = [];
+    onopen: (() => void) | null = null;
+    onmessage: ((event: { data: string }) => void | Promise<void>) | null = null;
+    onclose: ((event: { code: number; reason: string }) => void) | null = null;
+    onerror: (() => void) | null = null;
+    sent: string[] = [];
+    constructor(_url: string) {
+      FakeWebSocket.instances.push(this);
+    }
+    send(payload: string) {
+      this.sent.push(payload);
+    }
+    close() {}
+  }
+
+  async function connect(options: Record<string, unknown>) {
+    FakeWebSocket.instances = [];
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+    const { connectGateway } = await import("../src/gateway.js");
+    const ctx = makeCtx();
+    (ctx.http.fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: async () => ({ url: "wss://gateway.discord.test" }),
+    });
+    const handle = await connectGateway(ctx, "fake-token", vi.fn(), undefined, {
+      listenForMessages: false,
+      includeMessageContent: false,
+      ...options,
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    await socket.onmessage?.({
+      data: JSON.stringify({ op: 10, d: { heartbeat_interval: 10000 }, s: null, t: null }),
+    });
+    return { handle, socket, ctx };
+  }
+
+  it("requests GUILD_MESSAGE_REACTIONS only when a reaction handler is given", async () => {
+    const without = await connect({});
+    expect(JSON.parse(without.socket.sent[0]!).d.intents).toBe(1);
+    without.handle.close();
+
+    const withHandler = await connect({ onReaction: vi.fn() });
+    expect(JSON.parse(withHandler.socket.sent[0]!).d.intents).toBe(1 | 1024);
+    withHandler.handle.close();
+  });
+
+  it("dispatches MESSAGE_REACTION_ADD, and a throwing handler does not escape", async () => {
+    const onReaction = vi.fn().mockRejectedValueOnce(new Error("boom")).mockResolvedValue(undefined);
+    const { handle, socket, ctx } = await connect({ onReaction });
+    const event = {
+      user_id: "1",
+      channel_id: "2",
+      message_id: "3",
+      guild_id: "4",
+      emoji: { id: null, name: "🧠" },
+    };
+    const frame = { data: JSON.stringify({ op: 0, d: event, s: 1, t: "MESSAGE_REACTION_ADD" }) };
+
+    await socket.onmessage?.(frame);
+    await socket.onmessage?.(frame);
+
+    expect(onReaction).toHaveBeenCalledTimes(2);
+    expect(onReaction).toHaveBeenLastCalledWith(event);
+    expect(ctx.logger.error).toHaveBeenCalledWith("Gateway reaction handler error", { error: "boom" });
+    handle.close();
+  });
+});
+
 describe("respondViaCallback", () => {
   let originalFetch: typeof globalThis.fetch;
 

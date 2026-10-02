@@ -275,6 +275,44 @@ const manifest: PaperclipPluginManifestV1 = {
           "Route Discord replies to bot notifications back to Paperclip as issue comments or escalation responses.",
         default: DEFAULT_CONFIG.enableInbound,
       },
+      enableMemoryCapture: {
+        type: "boolean",
+        title: "Enable memory capture by reaction",
+        description:
+          "A linked Paperclip user reacts to a Discord message with the capture emoji; the plugin files the message as an issue so an agent records it in the knowledge base. Who can trigger it: users on the privileged user/role lists, and users who ran /clip link and are active non-viewer members of the company. Nobody else, even when no list is set.",
+        default: DEFAULT_CONFIG.enableMemoryCapture,
+      },
+      memoryCaptureEmoji: {
+        type: "string",
+        title: "Memory capture emoji",
+        description: "The reaction that files a message. A unicode emoji, or a custom emoji's name or id.",
+        default: DEFAULT_CONFIG.memoryCaptureEmoji,
+      },
+      memoryCaptureChannelIds: {
+        type: "array",
+        items: { type: "string" },
+        title: "Memory capture channels",
+        description: "Channel IDs where the capture reaction works. Leave empty to allow every channel of the default guild.",
+        default: DEFAULT_CONFIG.memoryCaptureChannelIds,
+      },
+      memoryCaptureProjectId: {
+        type: "string",
+        title: "Memory capture project ID",
+        description: "Paperclip project the capture issues are created in. Leave empty to create them without a project.",
+        default: DEFAULT_CONFIG.memoryCaptureProjectId,
+      },
+      memoryCaptureAssigneeAgentId: {
+        type: "string",
+        title: "Memory capture assignee (agent ID)",
+        description: "Agent the capture issues are assigned to. Leave empty to create them unassigned, which wakes no agent.",
+        default: DEFAULT_CONFIG.memoryCaptureAssigneeAgentId,
+      },
+      memoryCaptureInstructions: {
+        type: "string",
+        title: "Memory capture instructions",
+        description: "Text placed under \"What to do\" in every capture issue: where and how the assignee records the fact. Leave empty for a generic default.",
+        default: DEFAULT_CONFIG.memoryCaptureInstructions,
+      },
       topicRouting: {
         type: "boolean",
         title: "Enable topic/channel routing",

@@ -46,6 +46,12 @@ export const DEFAULT_CONFIG = {
   dailyDigestTime: "09:00",
   bidailySecondTime: "17:00",
   tridailyTimes: "07:00,13:00,19:00",
+  enableMemoryCapture: false,
+  memoryCaptureEmoji: "🧠",
+  memoryCaptureChannelIds: [] as string[],
+  memoryCaptureProjectId: "",
+  memoryCaptureAssigneeAgentId: "",
+  memoryCaptureInstructions: "",
   companyChannels: {} as Record<string, string>,
   approvalsChannels: {} as Record<string, string>,
 } as const;
@@ -81,6 +87,7 @@ export const METRIC_NAMES = {
   digestSent: "discord_digest_sent",
   workflowsExecuted: "discord_workflows_executed",
   budgetWarningsSent: "discord_budget_warnings_sent",
+  memoryCaptured: "discord_memory_captured",
 } as const;
 
 export const ROLE_WEIGHTS: Record<string, number> = {

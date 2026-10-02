@@ -294,6 +294,146 @@ export async function getChannelMessagesAll(
   return allMessages;
 }
 
+/** A message as returned by `GET /channels/{id}/messages/{id}`. */
+export interface DiscordFullMessage {
+  id: string;
+  content: string;
+  author: { id: string; username: string; global_name?: string | null; bot?: boolean };
+  timestamp: string;
+  edited_timestamp?: string | null;
+  mentions?: Array<{ id: string; username: string; global_name?: string | null }>;
+  attachments?: Array<{ id: string; filename: string }>;
+  message_reference?: { message_id?: string; channel_id?: string; guild_id?: string };
+  /** Present on replies; null when the replied-to message was deleted. */
+  referenced_message?: DiscordFullMessage | null;
+}
+
+/** One message by id, or null when it cannot be read. */
+export async function getMessage(
+  ctx: PluginContext,
+  token: string,
+  channelId: string | number,
+  messageId: string | number,
+): Promise<DiscordFullMessage | null> {
+  try {
+    const response = await discordFetch(
+      ctx,
+      token,
+      `/channels/${normalizeDiscordPathId(channelId)}/messages/${normalizeDiscordPathId(messageId)}`,
+    );
+    if (!response.ok) {
+      ctx.logger.warn("Discord message fetch failed", { status: response.status, channelId, messageId });
+      return null;
+    }
+    return (await response.json()) as DiscordFullMessage;
+  } catch (error) {
+    ctx.logger.warn("Discord message fetch failed", {
+      error: error instanceof Error ? error.message : String(error),
+      channelId,
+      messageId,
+    });
+    return null;
+  }
+}
+
+/**
+ * Up to `limit` messages posted just before `messageId`, oldest first.
+ * Empty on any failure: this is context, never a reason to fail the caller.
+ */
+export async function getMessagesBefore(
+  ctx: PluginContext,
+  token: string,
+  channelId: string | number,
+  messageId: string | number,
+  limit: number,
+): Promise<DiscordFullMessage[]> {
+  try {
+    const response = await discordFetch(
+      ctx,
+      token,
+      `/channels/${normalizeDiscordPathId(channelId)}/messages?before=${normalizeDiscordPathId(messageId)}&limit=${limit}`,
+    );
+    if (!response.ok) return [];
+    const page = (await response.json()) as DiscordFullMessage[];
+    return Array.isArray(page) ? page.slice().reverse() : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The name a person shows under in this guild: server nickname, else their
+ * global display name. Null when neither is set or the lookup fails.
+ */
+export async function getMemberDisplayName(
+  ctx: PluginContext,
+  token: string,
+  guildId: string | number,
+  userId: string | number,
+): Promise<string | null> {
+  try {
+    const response = await discordFetch(
+      ctx,
+      token,
+      `/guilds/${normalizeDiscordPathId(guildId)}/members/${normalizeDiscordPathId(userId)}`,
+    );
+    if (!response.ok) return null;
+    const data = (await response.json()) as { nick?: string | null; user?: { global_name?: string | null } };
+    return data.nick || data.user?.global_name || null;
+  } catch {
+    return null;
+  }
+}
+
+/** A channel's name, or null. Used for labels only, so failure is not an error. */
+export async function getChannelName(
+  ctx: PluginContext,
+  token: string,
+  channelId: string | number,
+): Promise<string | null> {
+  try {
+    const response = await discordFetch(ctx, token, `/channels/${normalizeDiscordPathId(channelId)}`);
+    if (!response.ok) return null;
+    const data = (await response.json()) as { name?: string };
+    return data.name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Add the bot's own reaction to a message.
+ *
+ * Native fetch, not `ctx.http.fetch`: Discord answers 204, and the SDK client
+ * rebuilds the response with a body, which throws on a null-body status (the
+ * same reason `respondViaCallback` uses native fetch).
+ */
+export async function addReaction(
+  ctx: PluginContext,
+  token: string,
+  channelId: string | number,
+  messageId: string | number,
+  emoji: string,
+): Promise<boolean> {
+  const url =
+    `${DISCORD_API_BASE}/channels/${normalizeDiscordPathId(channelId)}` +
+    `/messages/${normalizeDiscordPathId(messageId)}/reactions/${encodeURIComponent(emoji)}/@me`;
+  try {
+    const response = await fetch(url, { method: "PUT", headers: { Authorization: `Bot ${token}` } });
+    if (!response.ok) {
+      ctx.logger.warn("Discord reaction failed", { status: response.status, channelId, messageId });
+    }
+    return response.ok;
+  } catch (error) {
+    ctx.logger.warn("Discord reaction failed", {
+      error: error instanceof Error ? error.message : String(error),
+      channelId,
+      messageId,
+    });
+    return false;
+  }
+}
+
 export async function getGuildRoles(
   ctx: PluginContext,
   token: string,
